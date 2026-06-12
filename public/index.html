@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Arena — test client</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, system-ui, sans-serif; background: #0f1117; color: #e6e6e6; margin: 0; padding: 24px; display: flex; justify-content: center; }
+  .app { width: 100%; max-width: 560px; }
+  .card { background: #1a1d27; border: 1px solid #2a2e3d; border-radius: 12px; padding: 20px; margin-bottom: 16px; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  button { background: #3b5bfd; color: white; border: 0; border-radius: 8px; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+  button:disabled { opacity: .45; cursor: default; }
+  input { background: #11131b; color: #eee; border: 1px solid #2a2e3d; border-radius: 8px; padding: 10px; font-size: 14px; width: 200px; }
+  .muted { color: #8b90a0; font-size: 13px; }
+  .timer { font-variant-numeric: tabular-nums; font-size: 28px; font-weight: 700; margin: 8px 0; }
+  .option { display: block; width: 100%; text-align: left; margin: 6px 0; background: #232736; }
+  .option.picked { background: #3b5bfd; }
+  .option.correct { background: #1e7d46; }
+  .option.wrong { background: #8d2f39; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 99px; font-size: 12px; margin-left: 8px; background: #2a2e3d; }
+  .graph-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .graph-bar { height: 18px; background: #3b5bfd; border-radius: 4px; min-width: 4px; }
+  .me .graph-bar { background: #25c277; }
+  #log { font-size: 12px; color: #6c7180; max-height: 120px; overflow: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="card">
+    <h1>Live Quiz Arena <span id="conn" class="badge">offline</span></h1>
+    <div id="login">
+      <input id="name" placeholder="Your name" />
+      <button id="connect">Connect</button>
+      <div class="muted" style="margin-top:8px">Your player id is stored in this tab; reconnects keep your seat.</div>
+    </div>
+    <div id="arenas" style="display:none"></div>
+  </div>
+
+  <div class="card" id="game" style="display:none">
+    <h2 id="phase-title"></h2>
+    <div class="timer" id="timer">--</div>
+    <div id="content"></div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+// Anything that came from another user (names) or the DB (question text)
+// must be escaped before going through innerHTML.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+let socket = null;
+let timeOffset = 0;          // serverTime - clientTime
+let view = null;             // current screen state
+let myUserId = sessionStorage.getItem("arena_userId") || undefined;
+let arenaGroupId = null;
+let countdownTimer = null;
+
+const log = (m) => { $("log").textContent = `${new Date().toLocaleTimeString()}  ${m}\n` + $("log").textContent; };
+const now = () => Date.now() + timeOffset;
+
+$("connect").onclick = () => {
+  const name = $("name").value.trim() || "Player";
+  socket = io({ auth: { userId: myUserId, name } });
+
+  socket.on("connect", () => { $("conn").textContent = "online"; log("connected"); if (arenaGroupId) join(arenaGroupId); else loadArenas(); });
+  socket.on("disconnect", (r) => { $("conn").textContent = "offline"; log("disconnected: " + r); });
+  socket.on("session", (s) => {
+    myUserId = s.userId;
+    sessionStorage.setItem("arena_userId", s.userId);
+    // Auto-reconnects re-send socket.auth — keep it pointing at THIS player,
+    // or a reconnect after a server restart would get a fresh guest identity.
+    socket.auth = { ...socket.auth, userId: s.userId };
+    log(`you are ${s.name} (${s.userId.slice(-6)})`);
+  });
+  socket.on("arena:question", (p) => { syncClock(p.serverTime); showQuestion(p.round, p.question, p.endsAt, null); });
+  socket.on("arena:result", (p) => { syncClock(p.serverTime); showResult(p); });
+  socket.on("arena:online", (p) => log(`online in arena: ${p.count}`));
+  $("login").style.display = "none";
+};
+
+function syncClock(serverTime) { if (serverTime) timeOffset = serverTime - Date.now(); }
+
+async function loadArenas() {
+  const res = await fetch("/api/arena-groups").then((r) => r.json());
+  const box = $("arenas");
+  box.style.display = "block";
+  box.innerHTML = "<h2>Pick an arena</h2>";
+  for (const g of res.data) {
+    const b = document.createElement("button");
+    b.textContent = `${g.title} — ${g.subtitle || ""}`;
+    b.onclick = () => join(g._id);
+    box.appendChild(b);
+  }
+  if (!res.data.length) box.innerHTML += '<div class="muted">No active arenas — run <code>npm run seed</code>.</div>';
+}
+
+function join(id) {
+  socket.emit("arena:join", { arenaGroupId: id }, (snap) => {
+    if (!snap.ok) return log("join failed: " + snap.message);
+    arenaGroupId = id;
+    $("game").style.display = "block";
+    syncClock(snap.serverTime);
+    applySnapshot(snap);
+  });
+}
+
+function applySnapshot(s) {
+  if (s.noQuestions) {
+    setScreen("No questions in this arena yet", null);
+    $("content").innerHTML = '<div class="muted">This arena\'s filter matches no questions in the bank — pick another arena.</div>';
+    return;
+  }
+  if (s.status !== "running") return showIdle();
+  if (s.waiting) return showWaiting(s.serverTime + s.waitMs);
+  if (s.phase === "question") showQuestion(s.round, s.question, s.phaseEndsAt, s.yourAnswer);
+  else if (s.phase === "result" && s.result) showResult(s.result);
+}
+
+function setScreen(title, endsAt, label) {
+  $("phase-title").textContent = title;
+  clearInterval(countdownTimer);
+  const paint = () => {
+    const left = Math.max(0, (endsAt ?? now()) - now());
+    $("timer").textContent = endsAt ? `${(left / 1000).toFixed(1)}s ${label || ""}` : "";
+    if (left <= 0) clearInterval(countdownTimer);
+  };
+  paint();
+  countdownTimer = setInterval(paint, 100);
+}
+
+function showIdle() { setScreen("Arena is quiet…", null); $("content").innerHTML = '<div class="muted">Waiting for the game to start.</div>'; }
+
+function showWaiting(nextQuestionAt) {
+  setScreen("You're in! Waiting for the next question", nextQuestionAt);
+  $("content").innerHTML = '<div class="muted">A round is in progress — you join when the next question appears.</div>';
+}
+
+// Options from the question bank are {text, image} — either may be null.
+function optionLabel(opt, i) {
+  let html = `${"ABCD"[i]}. `;
+  if (opt && typeof opt === "object") {
+    if (opt.text) html += esc(opt.text);
+    if (opt.image) html += /^https?:/.test(opt.image)
+      ? ` <img src="${esc(opt.image)}" style="max-height:48px;vertical-align:middle">`
+      : " (image option)";
+    if (!opt.text && !opt.image) html += "(option unavailable)";
+  } else {
+    html += esc(opt);
+  }
+  return html;
+}
+
+function questionBody(q) {
+  let html = `<p>${esc(q.text)}</p>`;
+  for (const src of q.images || []) {
+    html += /^https?:/.test(src)
+      ? `<img src="${esc(src)}" style="max-width:100%">`
+      : `<div class="muted">(image: ${esc(src)})</div>`;
+  }
+  return html;
+}
+
+function showQuestion(round, q, endsAt, yourAnswer) {
+  view = { type: "question", round, picked: yourAnswer?.selectedOption ?? null };
+  setScreen(`Question #${round} (${["", "easy", "medium", "hard"][q.difficulty] || "?"})`, endsAt, "to answer");
+  const box = $("content");
+  box.innerHTML = questionBody(q);
+  q.options.forEach((opt, i) => {
+    const b = document.createElement("button");
+    b.className = "option" + (view.picked === i ? " picked" : "");
+    b.innerHTML = optionLabel(opt, i);
+    b.disabled = view.picked !== null;
+    b.onclick = () => answer(round, i);
+    box.appendChild(b);
+  });
+}
+
+function answer(round, i) {
+  socket.emit("arena:answer", { round, selectedOption: i }, (res) => {
+    if (!res.ok) return log("answer rejected: " + res.message);
+    log(`answer locked in ${(res.timeTakenMs / 1000).toFixed(1)}s`);
+    document.querySelectorAll(".option").forEach((b, j) => { b.disabled = true; b.classList.toggle("picked", j === i); });
+  });
+}
+
+function showResult(p) {
+  const titles = { correct: "✅ Correct!", wrong: "❌ Wrong", not_attempted: "⏰ Not attempted" };
+  setScreen(titles[p.outcome] || "Result", p.nextQuestionAt, "to next question");
+  const box = $("content");
+  box.innerHTML = questionBody(p.question);
+  p.question.options.forEach((opt, i) => {
+    const div = document.createElement("button");
+    div.disabled = true;
+    div.className = "option" +
+      (i === p.correctOption ? " correct" : i === p.yourAnswer?.selectedOption ? " wrong" : "");
+    div.innerHTML = optionLabel(opt, i);
+    box.appendChild(div);
+  });
+  box.innerHTML += `<p class="muted"><b>Explanation:</b> ${esc(p.explanation) || "—"}</p>`;
+  for (const src of p.solutionImages || []) {
+    if (/^https?:/.test(src)) box.innerHTML += `<img src="${esc(src)}" style="max-width:100%">`;
+  }
+  if (p.graph) {
+    const max = Math.max(...p.graph.map((g) => g.timeTakenMs), 1);
+    box.innerHTML += "<h2>Speed ranking</h2>";
+    for (const g of p.graph) {
+      const row = document.createElement("div");
+      row.className = "graph-row" + (g.userId === myUserId ? " me" : "");
+      row.innerHTML = `<span style="width:24px">#${g.rank}</span>
+        <div class="graph-bar" style="width:${Math.max(4, 60 - (g.timeTakenMs / max) * 56)}%"></div>
+        <span>${esc(g.name) || "Player"} — ${(g.timeTakenMs / 1000).toFixed(1)}s${g.userId === myUserId ? " (you)" : ""}</span>`;
+      box.appendChild(row);
+    }
+  }
+}
+</script>
+</body>
+</html>
