@@ -1,39 +1,30 @@
-import mongoose from "mongoose";
 import Question from "../models/Question.js";
 import { IMAGE_BASE_URL } from "../config/env.js";
 
 /**
- * Serve questions IN SEQUENCE (the order they sit in MongoDB, _id ascending)
- * rather than randomly. The game state only remembers the last served
- * question id (`afterQuestionId`); the next question is the first one past
- * it that matches the arena's filter. When the pool is exhausted the
- * sequence wraps to the beginning — no recent-questions list needed.
+ * Serve a RANDOM question matching the arena's `filter` (MongoDB `$sample`).
+ * `filter` is { subject?, chapter?, difficulty?, question_type? }, each an
+ * array. Returns null when the filter matches nothing.
+ *
+ * `$sample` returns a plain object, so rehydrate it into a Mongoose doc —
+ * the engine reads virtuals (`correctOption`, `explanation`) off the result.
  */
-export async function pickQuestion(arenaGroup, afterQuestionId = null) {
-  const match = buildMatch(arenaGroup);
-
-  let picked = null;
-  if (afterQuestionId && mongoose.isValidObjectId(afterQuestionId)) {
-    picked = await Question.findOne({
-      ...match,
-      _id: { $gt: new mongoose.Types.ObjectId(afterQuestionId) },
-    }).sort({ _id: 1 });
-  }
-  if (!picked) {
-    // First question of a fresh sequence, or wrap-around at the end.
-    picked = await Question.findOne(match).sort({ _id: 1 });
-  }
-  return picked;
+export async function pickQuestion(filter) {
+  const [doc] = await Question.aggregate([
+    { $match: buildMatch(filter) },
+    { $sample: { size: 1 } },
+  ]);
+  return doc ? Question.hydrate(doc) : null;
 }
 
-function buildMatch(arenaGroup) {
-  const filter = arenaGroup?.filter || {};
+function buildMatch(filter = {}) {
+  const f = filter || {};
   const match = {};
-  if (filter.subject?.length) match.subject = { $in: filter.subject };
-  if (filter.chapter?.length) match.chapter = { $in: filter.chapter };
-  if (filter.difficulty?.length) match.difficulty = { $in: filter.difficulty };
+  if (f.subject?.length) match.subject = { $in: f.subject };
+  if (f.chapter?.length) match.chapter = { $in: f.chapter };
+  if (f.difficulty?.length) match.difficulty = { $in: f.difficulty };
   // ArenaGroup.filter.question_type maps to qType in the question bank.
-  if (filter.question_type?.length) match.qType = { $in: filter.question_type };
+  if (f.question_type?.length) match.qType = { $in: f.question_type };
   // Only questions with a usable single correct answer (0..3).
   match["answer.0"] = { $in: [0, 1, 2, 3, "0", "1", "2", "3"] };
   return match;

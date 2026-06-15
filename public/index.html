@@ -118,7 +118,6 @@ function applySnapshot(s) {
     return;
   }
   if (s.status !== "running") return showIdle();
-  if (s.waiting) return showWaiting(s.serverTime + s.waitMs);
   if (s.phase === "question") showQuestion(s.round, s.question, s.phaseEndsAt, s.yourAnswer);
   else if (s.phase === "result" && s.result) showResult(s.result);
 }
@@ -136,11 +135,6 @@ function setScreen(title, endsAt, label) {
 }
 
 function showIdle() { setScreen("Arena is quiet…", null); $("content").innerHTML = '<div class="muted">Waiting for the game to start.</div>'; }
-
-function showWaiting(nextQuestionAt) {
-  setScreen("You're in! Waiting for the next question", nextQuestionAt);
-  $("content").innerHTML = '<div class="muted">A round is in progress — you join when the next question appears.</div>';
-}
 
 // Options from the question bank are {text, image} — either may be null.
 function optionLabel(opt, i) {

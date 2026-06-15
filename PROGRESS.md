@@ -3,10 +3,23 @@
 ## Status
 
 Feature-complete against [Arena_feature.md](Arena_feature.md): game loop
-(question → result → question), difficulty-based timers, waiting joiners,
-answer locking, personalized result screens with the speed graph, reconnect
-snapshots, crash recovery, and CAS-guarded transitions for future multi-server
-deployment.
+(question → result → question), difficulty-based timers, answer locking,
+personalized result screens with the speed graph, reconnect snapshots, crash
+recovery, and CAS-guarded transitions for future multi-server deployment.
+
+**Waiting phase removed (2026-06-14).** Joiners no longer sit on a waiting
+screen until the next question — the join snapshot drops them directly onto the
+current arena phase: if a question is live they see it and can answer it right
+away, and if a result is live they see that result. This deleted the
+per-user `eligibleFromRound` machinery entirely (`resolveEligibility`, Redis
+`presence` hash, `REJOIN_GRACE_MS`/`JOIN_START_WINDOW_MS`, the `WAITING` answer
+error, and the snapshot `waiting`/`waitMs` fields) from the engine, socket
+layer, liveStore, and clients. The test scripts (e2e, load, Playwright
+arena.spec) and the `play` TUI were updated to the new behavior but have NOT
+been re-run yet — so the "Verified (2026-06-12)" results below predate this
+change and their waiting-specific assertions no longer apply. NOTE: README.md,
+ARCHITECTURE.md, and Arena_feature.md still describe the old waiting design and
+are stale on this point.
 
 **Bot service added (2026-06-12)** per the bot spec: every active arena holds
 10–100 bots whose count random-walks every 10s (join/leave), each bot is a
@@ -21,10 +34,21 @@ carry `photo` (denormalized onto answers like `userName`), for humans too.
 Disable with `BOTS_ENABLED=false`.
 
 Architecture (after the Redis migration): **Redis is the live database** —
-game state (Lua CAS transitions), current-round answers, presence, online
-counts. **Mongo is history** — questions, arenas, users, flushed answers.
-Phase boundaries do no Mongo work on the critical path; the answer flush is
-fire-and-forget. Trade-offs accepted: Redis is now required for the game to
+game state (Lua CAS transitions), current-round answers, online counts.
+**Mongo is durable reference data only** — questions, arenas, users. Phase
+boundaries do no Mongo work on the critical path.
+
+**Answers are Redis-only (2026-06-14).** Raw answers are never persisted to
+Mongo — there's no product need for historical answer analytics. They live in
+a per-round Redis hash, drive the live result, survive the 15s result phase
+(`ANSWER_TTL_MS`) so reconnects still recompute it, and are cleared when the
+next round starts (`clearRound`). This removed the `flushAnswers` batch write,
+both Mongo answer fallbacks, and the `ArenaAnswer` model entirely. Trade-off:
+a Redis outage mid-round loses that round's answers (acceptable — Redis already
+holds the game state, so the game can't run without it). If per-user
+history/leaderboards are ever needed, persist *aggregates*, not raw rows.
+
+Other trade-offs accepted: Redis is now required for the game to
 run, and Redis durability is RDB/AOF-based — run Redis with
 `--appendonly yes` in production. The old `arena_games` / `arena_presences`
 Mongo collections are unused (stale data may remain; safe to drop).

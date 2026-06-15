@@ -1,5 +1,4 @@
 import ArenaGroup from "../models/ArenaGroupModel.js";
-import ArenaAnswer from "../models/ArenaAnswerModel.js";
 import Question from "../models/Question.js";
 import {
   pickQuestion,
@@ -15,17 +14,14 @@ import {
 
 export const arenaRoom = (arenaGroupId) => `arena:${arenaGroupId}`;
 
-// Arena group (title/filter) changes rarely; cache it off the loop's path.
-const GROUP_CACHE_MS = 60_000;
-
 /**
  * Drives the question → result → question loop for every arena.
  *
  * All LIVE state lives in Redis (see liveStore.js): the game document,
- * the current round's answers, online counts and presence. Mongo holds only
- * durable data — questions, arena definitions, users, and finished rounds'
- * answers (batch-flushed). A phase boundary therefore performs no Mongo work
- * on its critical path: one Redis CAS + one Redis read + local broadcasts.
+ * the current round's answers and online counts. Answers are Redis-only —
+ * never persisted to Mongo; Mongo holds only durable reference data
+ * (questions, arena definitions, users). A phase boundary therefore performs
+ * no Mongo work: one Redis CAS + one Redis read + local broadcasts.
  *
  * Design rules that give the architecture guarantees from Arena_feature.md:
  *  - Timers are absolute `phaseEndsAt` timestamps, never in-memory
@@ -45,22 +41,26 @@ const GROUP_CACHE_MS = 60_000;
 export function createGameEngine(io, liveStore, hooks = {}) {
   /** arenaGroupId -> setTimeout handle for the next phase boundary */
   const timers = new Map();
-  /** arenaGroupId -> { round, question } so answers don't hit any DB */
-  const questionCache = new Map();
   /** arenaGroupId -> "round:phase" last emitted by THIS server */
   const lastAnnounced = new Map();
   /** arenaGroupId -> last known game state (valid until its phase boundary) */
   const gameCache = new Map();
-  /** arenaGroupId -> { group, at } */
-  const groupCache = new Map();
+
+  setInterval(()=>{
+    console.log("gameCache====>>>>",gameCache)
+    console.log("lastAnnounced====>>>>",lastAnnounced)
+    console.log("timers====>>>>",timers)
+
+  },3000)
 
   // ---------------------------------------------------------------- public
 
   /**
-   * Make sure the arena has a running game. Called when a user joins:
-   * if nobody was playing (status idle) the game starts immediately.
-   * Returns { game, started } — `started` is true when THIS call won the
-   * idle→running transition (its caller gets to play the new round).
+   * Make sure the arena has a running game. Called when a user joins: if
+   * nobody was playing (status idle) the game starts immediately, otherwise
+   * the existing live game is returned untouched.
+   * Returns { game, started, noQuestions }; `started` is true when THIS call
+   * won the idle→running transition.
    */
   async function ensureRunning(arenaGroupId) {
     let game = await liveStore.ensureGame(arenaGroupId);
@@ -70,8 +70,8 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       return { game, started: false, noQuestions: false };
     }
 
-    const group = await getGroup(arenaGroupId);
-    const { game: won, noQuestions } = await startRound(game, group, guardOf(game));
+    const filter = await filterFor(game);
+    const { game: won, noQuestions } = await startRound(game, filter, guardOf(game));
     game = won || (await liveStore.getGame(arenaGroupId)) || game;
     cacheGame(game);
     await announce(game);
@@ -95,9 +95,6 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       // their state from the join snapshot, not a re-broadcast.
       lastAnnounced.set(String(game.arenaGroupId), announceKey(game));
       cacheGame(game);
-      // If the crash happened between the result transition and the answer
-      // flush, the round's answers are still only in Redis — persist them.
-      if (game.phase === "result") await flushAnswers(game);
       scheduleNext(game);
     }
     if (games.length) {
@@ -109,7 +106,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
    * Everything a (re)joining client needs to land exactly where the game is:
    * current phase, synced timers, the live question or the full result.
    */
-  async function buildSnapshot(game, { userId, eligibleFromRound }) {
+  async function buildSnapshot(game, { userId }) {
     const now = Date.now();
     const remainingMs = game?.phaseEndsAt
       ? Math.max(0, game.phaseEndsAt.getTime() - now)
@@ -121,41 +118,22 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       round: game?.round ?? 0,
       phaseEndsAt: game?.phaseEndsAt ? game.phaseEndsAt.getTime() : null,
       remainingMs,
-      eligibleFromRound,
-      waiting: false,
-      waitMs: 0,
       question: null,
       result: null,
       yourAnswer: null,
     };
     if (!game || game.status !== "running") return snapshot;
 
-    const waiting = eligibleFromRound > game.round;
-    if (waiting) {
-      // Waiting timer = until the next question appears.
-      snapshot.waiting = true;
-      snapshot.waitMs =
-        game.phase === "question"
-          ? remainingMs + RESULT_DURATION_MS
-          : remainingMs;
-      return snapshot;
-    }
-
+    // No waiting phase: a joiner lands directly on the live phase — they can
+    // answer the current question, or see the current round's result.
     if (game.phase === "question") {
       const question = await getQuestionFor(game);
       snapshot.question = question ? sanitizeQuestion(question) : null;
-      let answer = await liveStore.getAnswer(
+      const answer = await liveStore.getAnswer(
         game.arenaGroupId,
         game.round,
         userId
       );
-      if (!answer) {
-        answer = await ArenaAnswer.findOne({
-          arenaGroupId: game.arenaGroupId,
-          round: game.round,
-          userId,
-        }).lean();
-      }
       if (answer) {
         snapshot.yourAnswer = {
           selectedOption: answer.selectedOption,
@@ -193,9 +171,6 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     if (round !== game.round) {
       throw err("WRONG_ROUND", "This question is no longer live");
     }
-    if (user.eligibleFromRound > game.round) {
-      throw err("WAITING", "You join the game at the next question");
-    }
     const now = Date.now();
     if (now > game.phaseEndsAt.getTime() + ANSWER_GRACE_MS) {
       throw err("TOO_LATE", "Time is up for this question");
@@ -221,22 +196,15 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       answeredAt: new Date(now).toISOString(),
     };
 
-    if (liveStore.isHealthy()) {
-      const saved = await liveStore.saveAnswer(arenaGroupId, game.round, answer);
-      if (!saved) {
-        throw err("ALREADY_ANSWERED", "You already answered this question");
-      }
-    } else {
-      // Redis briefly unavailable — write straight to Mongo (unique index
-      // dedupes) so a player's answer is never dropped.
-      try {
-        await ArenaAnswer.create(answer);
-      } catch (e) {
-        if (e?.code === 11000) {
-          throw err("ALREADY_ANSWERED", "You already answered this question");
-        }
-        throw e;
-      }
+    // Answers live only in Redis (one round at a time). Redis is the live
+    // database, so if it's down the game isn't really running — reject rather
+    // than silently drop the answer.
+    if (!liveStore.isHealthy()) {
+      throw err("NOT_ACCEPTING", "Service temporarily unavailable");
+    }
+    const saved = await liveStore.saveAnswer(arenaGroupId, game.round, answer);
+    if (!saved) {
+      throw err("ALREADY_ANSWERED", "You already answered this question");
     }
     // Correctness is never revealed before the result screen.
     return { locked: true, round: game.round, selectedOption, timeTakenMs };
@@ -244,12 +212,16 @@ export function createGameEngine(io, liveStore, hooks = {}) {
 
   // ----------------------------------------------------------- game loop
 
+  /**
+   * Arm a single timer that fires `tick` at this game's `phaseEndsAt`.
+   * Replaces any existing timer for the arena; clears it (and the question
+   * cache) when the game is no longer running.
+   */
   function scheduleNext(game) {
     const key = String(game.arenaGroupId);
     clearTimeout(timers.get(key));
     timers.delete(key);
     if (game.status !== "running" || !game.phaseEndsAt) {
-      questionCache.delete(key);
       return;
     }
     const delay = Math.max(0, game.phaseEndsAt.getTime() - Date.now());
@@ -265,6 +237,12 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     );
   }
 
+  /**
+   * Advance one phase boundary: question → result, or result → (next
+   * question | idle if the arena emptied). The move is a CAS, so when several
+   * servers tick at once exactly one wins; the rest re-read the new state.
+   * Then cache, broadcast, and re-arm the timer for the phase just entered.
+   */
   async function tick(arenaGroupId) {
     const game = await liveStore.getGame(arenaGroupId);
     if (!game || game.status !== "running") return;
@@ -281,7 +259,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       // Anchor the result phase to the scheduled question end, so timers stay
       // identical for everyone even if this tick fired slightly late.
       const resultStartMs = game.phaseEndsAt.getTime();
-      const { won, game: after } = await liveStore.casGame(
+      const { game: after } = await liveStore.casGame(
         arenaGroupId,
         guardOf(game),
         {
@@ -291,14 +269,6 @@ export function createGameEngine(io, liveStore, hooks = {}) {
           phaseEndsAt: resultStartMs + RESULT_DURATION_MS,
         }
       );
-      // The transition winner persists the round's answers to Mongo.
-      // Fire-and-forget: results are computed from Redis, so the broadcast
-      // never waits on this write; recovery re-flushes if it fails.
-      if (won) {
-        flushAnswers(game).catch((e) =>
-          console.error("[engine] background answer flush failed:", e.message)
-        );
-      }
       current = after || game;
     } else if (game.phase === "result") {
       const online = await liveStore.getOnline(arenaGroupId);
@@ -319,8 +289,8 @@ export function createGameEngine(io, liveStore, hooks = {}) {
         );
         current = after || game;
       } else {
-        const group = await getGroup(arenaGroupId);
-        const { game: won } = await startRound(game, group, guardOf(game));
+        const filter = await filterFor(game);
+        const { game: won } = await startRound(game, filter, guardOf(game));
         current = won || (await liveStore.getGame(arenaGroupId)) || game;
       }
     }
@@ -331,14 +301,15 @@ export function createGameEngine(io, liveStore, hooks = {}) {
   }
 
   /**
-   * Move the game into a fresh question round. `guard` is the CAS condition
-   * (the idle state for a fresh start, or the finished result phase
-   * mid-loop). Returns { game, noQuestions } — game is the new state, or
-   * null if another server won the transition.
+   * Move the game into a fresh question round. `filter` is the arena's
+   * question filter (persisted into the game state so later rounds don't
+   * re-fetch it). `guard` is the CAS condition (the idle state for a fresh
+   * start, or the finished result phase mid-loop). Returns { game,
+   * noQuestions } — game is the new state, or null if another server won.
    */
-  async function startRound(game, group, guard) {
-    // Sequential serving: continue from the last question this arena used.
-    const question = await pickQuestion(group, game.lastQuestionId);
+  async function startRound(game, filter, guard) {
+    // Random serving: any question matching the arena's filter.
+    const question = await pickQuestion(filter);
     if (!question) {
       console.error(
         `[engine] no questions match the filter of arena ${game.arenaGroupId}; going idle`
@@ -369,16 +340,13 @@ export function createGameEngine(io, liveStore, hooks = {}) {
         questionDurationMs: durationMs,
         phaseStartedAt: nowMs,
         phaseEndsAt: nowMs + durationMs,
-        // The sequence cursor — pickQuestion serves the next one after this.
-        lastQuestionId: String(question._id),
+        // Carried in the game state so the next round reads it from Redis,
+        // not Mongo.
+        filter,
       }
     );
     if (!won) return { game: null, noQuestions: false };
 
-    questionCache.set(String(game.arenaGroupId), {
-      round: after.round,
-      question,
-    });
     cacheGame(after);
     if (hooks.onQuestionStarted) {
       // Fire-and-forget: bots must never delay the question broadcast.
@@ -386,7 +354,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
         console.error("[engine] onQuestionStarted hook failed:", e.message)
       );
     }
-    // Previous round is flushed to Mongo by now; free its Redis hash.
+    // The previous round's result has been shown; drop its answer hash.
     if (game.round > 0) {
       liveStore.clearRound(game.arenaGroupId, game.round).catch(() => {});
     }
@@ -423,15 +391,14 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     }
   }
 
+  /** Send each connected socket its own personalized copy of the result. */
   async function broadcastResults(game) {
     const results = await computeResults(game);
     if (!results.base) return;
     const sockets = await io.in(arenaRoom(game.arenaGroupId)).fetchSockets();
     for (const socket of sockets) {
-      const { userId, eligibleFromRound } = socket.data;
-      // Users still waiting for their first question stay on the waiting
-      // screen; they don't see results of a round they never played.
-      if (!userId || eligibleFromRound > game.round) continue;
+      const { userId } = socket.data;
+      if (!userId) continue;
       socket.emit("arena:result", personalizeResult(results, userId));
     }
   }
@@ -444,15 +411,10 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     const question = await getQuestionFor(game);
     if (!question) return { base: null, byUser: new Map(), graph: [] };
 
-    // Redis holds the live round; Mongo is the fallback (Redis down, or a
-    // reconnect after the round was flushed and its key expired).
-    let answers = await liveStore.getAnswers(game.arenaGroupId, game.round);
-    if (!answers?.length) {
-      answers = await ArenaAnswer.find({
-        arenaGroupId: game.arenaGroupId,
-        round: game.round,
-      }).lean();
-    }
+    // Answers live only in Redis, for the current round. The key outlives the
+    // 15s result phase (ANSWER_TTL_MS), so reconnects during the result still
+    // recompute it; it's cleared when the next round starts.
+    const answers = (await liveStore.getAnswers(game.arenaGroupId, game.round)) || [];
     answers.sort((a, b) => a.timeTakenMs - b.timeTakenMs);
 
     // The graph: only correct answers, ranked by speed (fastest first).
@@ -486,6 +448,12 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     return { base, byUser, graph, rankByUser };
   }
 
+  /**
+   * Tailor the shared result to one user: their outcome (correct/wrong/
+   * not_attempted), their own answer, and — only if they were correct —
+   * their rank and the speed graph (with their own entry appended when they
+   * placed below the top-N cap).
+   */
   function personalizeResult({ base, graph, byUser, rankByUser }, userId) {
     const answer = byUser.get(String(userId));
     const outcome = !answer
@@ -522,22 +490,21 @@ export function createGameEngine(io, liveStore, hooks = {}) {
 
   // --------------------------------------------------------------- helpers
 
+  // The CAS pre-condition: a transition only applies if the game is still in
+  // exactly this (status, phase, round) — how concurrent servers stay in sync.
   const guardOf = (game) => ({
     status: game.status,
     phase: game.phase,
     round: game.round,
   });
 
+  /** The current round's question, loaded from Mongo by its id. */
   async function getQuestionFor(game) {
-    const key = String(game.arenaGroupId);
-    const cached = questionCache.get(key);
-    if (cached && cached.round === game.round) return cached.question;
     if (!game.questionId) return null;
-    const question = await Question.findById(game.questionId);
-    if (question) questionCache.set(key, { round: game.round, question });
-    return question;
+    return Question.findById(game.questionId);
   }
 
+  /** Remember the latest game state for getGameCached; passes `game` through. */
   function cacheGame(game) {
     if (game) gameCache.set(String(game.arenaGroupId), game);
     return game;
@@ -561,31 +528,19 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     return cacheGame(await liveStore.getGame(arenaGroupId));
   }
 
-  async function getGroup(arenaGroupId) {
-    const key = String(arenaGroupId);
-    const cached = groupCache.get(key);
-    if (cached && Date.now() - cached.at < GROUP_CACHE_MS) return cached.group;
-    const group = await ArenaGroup.findById(arenaGroupId);
-    groupCache.set(key, { group, at: Date.now() });
-    return group;
-  }
-
   /**
-   * Move a finished round's answers from Redis into Mongo in one batch.
-   * Idempotent (unique index ignores duplicates), so safe to retry/repeat.
+   * The arena's question filter. Once a game has run a round it's stored in
+   * the game state (Redis), so the loop reads it from there; only a cold
+   * start (a brand-new arena's first round) falls back to a Mongo read.
    */
-  async function flushAnswers(game) {
-    const answers = await liveStore.getAnswers(game.arenaGroupId, game.round);
-    if (!answers?.length) return;
-    try {
-      await ArenaAnswer.insertMany(answers, { ordered: false });
-    } catch (e) {
-      if (e?.code !== 11000 && !e?.writeErrors?.every((w) => w.code === 11000)) {
-        console.error("[engine] answer flush failed:", e.message);
-      }
-    }
+  async function filterFor(game) {
+    if (game.filter) return game.filter;
+    const group = await ArenaGroup.findById(game.arenaGroupId);
+    return group?.filter ?? {};
   }
 
+  // An expected (rule-violation) error: `expected` tells the socket layer to
+  // return { code, message } to the client instead of logging it as a crash.
   function err(code, message) {
     const e = new Error(message);
     e.code = code;
@@ -593,6 +548,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     return e;
   }
 
+  /** Cancel every pending phase timer (server shutdown). */
   function stop() {
     for (const t of timers.values()) clearTimeout(t);
     timers.clear();

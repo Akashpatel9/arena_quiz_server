@@ -25,7 +25,7 @@ const roundNumber = async (page) => {
   return Number(t.match(/#(\d+)/)?.[1]);
 };
 
-test("two players: question → answer lock → waiting joiner → result → next round", async ({ browser }) => {
+test("two players: question → answer lock → mid-game joiner plays live → result → next round", async ({ browser }) => {
   // --- Alice joins; the game shows her a live question
   const alice = await joinAsPlayer(browser, "PW-Alice");
   await expect(phaseTitle(alice.page)).toContainText("Question #", { timeout: 30_000 });
@@ -39,11 +39,14 @@ test("two players: question → answer lock → waiting joiner → result → ne
     await expect(btn).toBeDisabled();
   }
 
-  // --- Bob joins mid-question (past the 2s join-start window): must wait
+  // --- Bob joins mid-question: lands directly on the live question (no wait)
   await alice.page.waitForTimeout(2500);
   const bob = await joinAsPlayer(browser, "PW-Bob");
-  await expect(phaseTitle(bob.page)).toContainText("Waiting for the next question");
-  await expect(bob.page.locator("#timer")).toContainText("s"); // waiting countdown runs
+  await expect(phaseTitle(bob.page)).toContainText(`Question #${round}`, { timeout: 30_000 });
+  await expect(bob.page.locator(".option")).toHaveCount(4);
+  // and can answer the current question right away
+  await bob.page.locator(".option").nth(0).click();
+  await expect(bob.page.locator(".option.picked")).toHaveCount(1);
 
   // --- Alice's result screen: outcome title, explanation, graph iff correct
   await expect(phaseTitle(alice.page)).toContainText(/Correct|Wrong|Not attempted/, {
@@ -58,10 +61,12 @@ test("two players: question → answer lock → waiting joiner → result → ne
   } else {
     await expect(graphRows).toHaveCount(0); // no graph for wrong/unattempted
   }
-  // Bob saw nothing of a round he didn't play
-  await expect(phaseTitle(bob.page)).toContainText("Waiting for the next question");
+  // Bob played the same round, so he gets its result too
+  await expect(phaseTitle(bob.page)).toContainText(/Correct|Wrong|Not attempted/, {
+    timeout: 30_000,
+  });
 
-  // --- next round: both land on the SAME question; Bob is in and can answer
+  // --- next round: both land on the SAME question
   await expect(phaseTitle(bob.page)).toContainText("Question #", { timeout: 30_000 });
   await expect(phaseTitle(alice.page)).toContainText(`Question #${round + 1}`, {
     timeout: 30_000,

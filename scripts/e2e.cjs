@@ -62,15 +62,22 @@ function check(label, ok, detail = "") {
   });
   check("second answer rejected", !dup.ok && dup.code === "ALREADY_ANSWERED");
 
-  // --- Bob joins mid-question: must wait for the next question
-  await sleep(2500); // past the join-start grace window
+  // --- Bob joins mid-question: lands directly on the live question
+  await sleep(2500);
   const B = await connect("Bob");
   const snapB = await call(B.socket, "arena:join", { arenaGroupId: arenaId });
   check(
-    "mid-game joiner waits for next question",
-    snapB.ok && snapB.waiting && snapB.waitMs > 0 && !snapB.question,
-    `waitMs ${snapB.waitMs}`
+    "mid-game joiner lands directly on the live question",
+    snapB.ok && !snapB.waiting && snapB.phase === "question" && snapB.question,
+    `round ${snapB.round}`
   );
+
+  // --- Bob can answer the current question right away (no waiting phase)
+  const ansB = await call(B.socket, "arena:answer", {
+    round: snapB.round,
+    selectedOption: 0,
+  });
+  check("mid-game joiner can answer the current question", ansB.ok === true);
 
   // --- Result reaches Alice with explanation; graph only if correct
   const resA = await once(A.socket, "arena:result");
@@ -94,11 +101,6 @@ function check(label, ok, detail = "") {
     "next round broadcast to everyone in sync",
     qA.round === snapA.round + 1 && qB.round === qA.round && qA.endsAt === qB.endsAt
   );
-  const ansB = await call(B.socket, "arena:answer", {
-    round: qB.round,
-    selectedOption: 0,
-  });
-  check("waiting user can answer once let in", ansB.ok === true);
 
   // --- Alice's connection drops and she reconnects: lands exactly in place
   A.socket.close();

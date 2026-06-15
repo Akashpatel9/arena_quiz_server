@@ -3,10 +3,6 @@ import mongoose from "mongoose";
 import AuthUser from "../models/AuthUser.js";
 import ArenaGroup from "../models/ArenaGroupModel.js";
 import { arenaRoom } from "../services/gameEngine.js";
-import {
-  REJOIN_GRACE_MS,
-  JOIN_START_WINDOW_MS,
-} from "../config/gameConstants.js";
 
 /**
  * Socket protocol (all client→server events take an ack callback):
@@ -26,9 +22,9 @@ import {
  * Reconnection: the client reconnects and re-emits arena:join; the snapshot
  * in the ack puts it exactly where the game is now.
  *
- * Presence and online counts live in Redis (liveStore) so any server can
- * answer a reconnect; ArenaGroup.online_user_count in Mongo is updated
- * best-effort purely for lobby display.
+ * Online counts live in Redis (liveStore) so any server can answer a
+ * reconnect; ArenaGroup.online_user_count in Mongo is updated best-effort
+ * purely for lobby display.
  */
 export function registerArenaSockets(io, engine, liveStore) {
   io.use(authMiddleware);
@@ -54,7 +50,6 @@ export function registerArenaSockets(io, engine, liveStore) {
             userId: socket.data.userId,
             name: socket.data.name,
             photo: socket.data.photo,
-            eligibleFromRound: socket.data.eligibleFromRound ?? Infinity,
           },
           round: payload?.round,
           selectedOption: payload?.selectedOption,
@@ -73,15 +68,13 @@ export function registerArenaSockets(io, engine, liveStore) {
 
     socket.on("arena:leave", (_payload, ack) =>
       safeHandler(ack, async () => {
-        await leaveArena(socket, { forfeitSeat: true });
+        await leaveArena(socket);
         return { ok: true };
       })
     );
 
     socket.on("disconnect", () => {
-      // A dropped connection KEEPS its seat (rejoin grace) — only a
-      // deliberate leave or arena switch forfeits it.
-      leaveArena(socket, { forfeitSeat: false }).catch((e) =>
+      leaveArena(socket).catch((e) =>
         console.error("[socket] disconnect cleanup failed:", e.message)
       );
     });
@@ -99,9 +92,7 @@ export function registerArenaSockets(io, engine, liveStore) {
 
     const rejoinSameArena = socket.data.arenaGroupId === String(arenaGroupId);
     if (socket.data.arenaGroupId && !rejoinSameArena) {
-      // Switching arenas forfeits the old seat: coming back later means
-      // joining fresh (wait for the next question), not resuming mid-round.
-      await leaveArena(socket, { forfeitSeat: true });
+      await leaveArena(socket);
     }
     if (!rejoinSameArena) {
       socket.join(arenaRoom(arenaGroupId));
@@ -109,77 +100,20 @@ export function registerArenaSockets(io, engine, liveStore) {
       await bumpOnlineCount(arenaGroupId, +1);
     }
 
-    const { game, started, noQuestions } = await engine.ensureRunning(arenaGroupId);
-    const eligibleFromRound = await resolveEligibility({
-      arenaGroupId,
-      userId: socket.data.userId,
-      game,
-      started,
-    });
-    socket.data.eligibleFromRound = eligibleFromRound;
+    const { game, noQuestions } = await engine.ensureRunning(arenaGroupId);
 
-    await liveStore.setPresence(arenaGroupId, socket.data.userId, {
-      eligibleFromRound,
-      connected: true,
-      lastSeenAt: Date.now(),
-    });
-
+    // No waiting phase: the snapshot drops the joiner straight onto the live
+    // phase — the current question (which they can answer) or its result.
     const snapshot = await engine.buildSnapshot(game, socket.data);
     if (noQuestions) snapshot.noQuestions = true;
     return snapshot;
   }
 
-  /**
-   * Which round may this user play from?
-   *  - they just started the game (or it started a heartbeat ago) → this round
-   *  - a quick reconnect inside the same cycle → whatever they had before
-   *  - everyone else (fresh joiners, long-gone users) → the next question
-   */
-  async function resolveEligibility({ arenaGroupId, userId, game, started }) {
-    if (game.status !== "running") return game.round + 1;
-
-    const now = Date.now();
-    const candidates = [game.round + 1];
-
-    if (
-      started ||
-      (game.phase === "question" &&
-        now - game.phaseStartedAt.getTime() <= JOIN_START_WINDOW_MS)
-    ) {
-      candidates.push(game.round);
-    }
-
-    const presence = await liveStore.getPresence(arenaGroupId, userId);
-    if (
-      presence &&
-      now - presence.lastSeenAt <= REJOIN_GRACE_MS &&
-      presence.eligibleFromRound <= game.round + 1
-    ) {
-      candidates.push(presence.eligibleFromRound);
-    }
-
-    return Math.min(...candidates);
-  }
-
-  async function leaveArena(socket, { forfeitSeat }) {
+  async function leaveArena(socket) {
     const arenaGroupId = socket.data.arenaGroupId;
     if (!arenaGroupId) return;
-    const eligibleFromRound = socket.data.eligibleFromRound;
     socket.data.arenaGroupId = null;
-    socket.data.eligibleFromRound = null;
     socket.leave(arenaRoom(arenaGroupId));
-    if (forfeitSeat) {
-      await liveStore.clearPresence(arenaGroupId, socket.data.userId);
-    } else if (eligibleFromRound != null) {
-      // Keep their seat info so a quick reconnect resumes the same round.
-      await liveStore
-        .setPresence(arenaGroupId, socket.data.userId, {
-          eligibleFromRound,
-          connected: false,
-          lastSeenAt: Date.now(),
-        })
-        .catch(() => {});
-    }
     await bumpOnlineCount(arenaGroupId, -1);
   }
 

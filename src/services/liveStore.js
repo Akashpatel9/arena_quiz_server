@@ -4,8 +4,6 @@ import { REDIS_URL } from "../config/env.js";
 // Live-round answers expire on their own if a flush never happens
 // (e.g. the arena went idle, or every server died mid-round).
 const ANSWER_TTL_MS = 30 * 60 * 1000;
-// Presence entries are touched on every join/leave; stale ones age out.
-const PRESENCE_TTL_MS = 24 * 60 * 60 * 1000;
 // Bot counts are touched on every drift step; arenas that stop drifting
 // (deactivated, server gone) age out instead of leaking keys.
 const BOTS_TTL_MS = 24 * 60 * 60 * 1000;
@@ -20,7 +18,7 @@ const BOTS_TTL_MS = 24 * 60 * 60 * 1000;
  *    Redis equivalent of the guarded findOneAndUpdate we used in Mongo.
  *  - Live answers: one hash per arena+round, HSETNX per answer ("one answer
  *    per user" with no locks). Batch-flushed to Mongo when the round ends.
- *  - Online count + presence (round eligibility): plain keys/hashes.
+ *  - Online count: a plain integer key per arena.
  *
  * Durability: game keys survive a Node crash because they live outside the
  * process. A Redis restart relies on Redis persistence — RDB snapshots by
@@ -66,7 +64,6 @@ export function createLiveStore() {
 
   const gameKey = (arenaGroupId) => `arena:{${arenaGroupId}}:game`;
   const onlineKey = (arenaGroupId) => `arena:{${arenaGroupId}}:online`;
-  const presenceKey = (arenaGroupId) => `arena:{${arenaGroupId}}:presence`;
   const botsKey = (arenaGroupId) => `arena:{${arenaGroupId}}:bots`;
   const answersKey = (arenaGroupId, round) =>
     `arena:{${arenaGroupId}}:r${round}:answers`;
@@ -78,7 +75,6 @@ export function createLiveStore() {
     phase: t.phase ?? null,
     phaseStartedAt: t.phaseStartedAt ? new Date(t.phaseStartedAt) : null,
     phaseEndsAt: t.phaseEndsAt ? new Date(t.phaseEndsAt) : null,
-    lastQuestionId: t.lastQuestionId ?? null,
   });
   const dehydrateGame = (g) => ({
     ...g,
@@ -117,7 +113,6 @@ export function createLiveStore() {
         questionDurationMs: null,
         phaseStartedAt: null,
         phaseEndsAt: null,
-        lastQuestionId: null, // sequence cursor for sequential serving
       });
       await redis.set(gameKey(arenaGroupId), idle, "NX");
       return this.getGame(arenaGroupId);
@@ -173,7 +168,6 @@ export function createLiveStore() {
       await redis.del(
         gameKey(arenaGroupId),
         onlineKey(arenaGroupId),
-        presenceKey(arenaGroupId),
         botsKey(arenaGroupId)
       );
     },
@@ -236,27 +230,6 @@ export function createLiveStore() {
       const set = await redis.set(key, count, "PX", BOTS_TTL_MS, "NX");
       if (set) return count;
       return Number(await redis.get(key)) || count;
-    },
-
-    // --------------------------------------------------------- presence
-
-    /** { eligibleFromRound, lastSeenAt(ms), connected } or null. */
-    async getPresence(arenaGroupId, userId) {
-      const raw = await redis.hget(presenceKey(arenaGroupId), String(userId));
-      return raw ? JSON.parse(raw) : null;
-    },
-
-    async setPresence(arenaGroupId, userId, data) {
-      const key = presenceKey(arenaGroupId);
-      await redis.hset(key, String(userId), JSON.stringify(data));
-      await redis.pexpire(key, PRESENCE_TTL_MS);
-    },
-
-    /** Forfeit a seat: the user's next join is treated as brand new. */
-    async clearPresence(arenaGroupId, userId) {
-      await redis
-        .hdel(presenceKey(arenaGroupId), String(userId))
-        .catch(() => {});
     },
 
     // ---------------------------------------------------------- answers

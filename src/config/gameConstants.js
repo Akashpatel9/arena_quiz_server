@@ -24,16 +24,6 @@ export const ANSWER_GRACE_MS = 1_000;
 // Without a cap the result broadcast is O(players²) bytes per round.
 export const GRAPH_TOP_LIMIT = 50;
 
-// A user whose connection dropped keeps their seat (and round eligibility)
-// if they come back within one full game cycle (max question 90s + result 15s).
-// Anyone away longer is treated like a fresh joiner and waits for the next
-// question.
-export const REJOIN_GRACE_MS = 105_000;
-
-// Two users joining an empty arena at nearly the same time should both play
-// round 1: anyone arriving this soon after a question started is let in.
-export const JOIN_START_WINDOW_MS = 2_000;
-
 export function questionDurationFor(difficulty) {
   return QUESTION_DURATION_MS[difficulty] ?? DEFAULT_QUESTION_DURATION_MS;
 }

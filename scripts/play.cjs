@@ -12,7 +12,7 @@ const C = {
   reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
   green: "\x1b[32m", red: "\x1b[31m", yellow: "\x1b[33m", cyan: "\x1b[36m",
 };
-let view = { mode: "connecting" }; // connecting|idle|waiting|question|result
+let view = { mode: "connecting" }; // connecting|idle|question|result
 let me = { userId: null, name: NAME };
 let arenaId = null;
 let offset = 0; // serverTime - local
@@ -26,8 +26,6 @@ function render() {
 
   if (view.mode === "connecting") out.push("connecting…");
   if (view.mode === "idle") out.push("arena is quiet — waiting for the game to start");
-  if (view.mode === "waiting")
-    out.push(`${C.yellow}You're in!${C.reset} A round is in progress.\nNext question in ${timer}`);
   const optText = (o) =>
     o && typeof o === "object" ? (o.text ?? (o.image ? "[image option]" : "?")) : o;
   if (view.mode === "question") {
@@ -84,7 +82,6 @@ async function join() {
     offset = snap.serverTime - Date.now();
     if (snap.noQuestions) { console.log("\nThis arena has no questions matching its filter — pick another arena."); process.exit(1); }
     if (snap.status !== "running") view = { mode: "idle" };
-    else if (snap.waiting) view = { mode: "waiting", endsAt: snap.serverTime + snap.waitMs };
     else if (snap.phase === "question")
       view = { mode: "question", round: snap.round, q: snap.question, endsAt: snap.phaseEndsAt, picked: snap.yourAnswer?.selectedOption ?? null };
     else if (snap.phase === "result")

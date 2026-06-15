@@ -1,7 +1,8 @@
 /**
  * Load test: N real socket clients join one arena, answer, and receive the
- * result — plus a late-joiner wave that must sit in 'waiting' and be let in
- * exactly at the next question. Measures ack latencies and fan-out spread.
+ * result — plus a late-joiner wave that lands directly on the live question
+ * mid-round (no waiting phase) and answers it too. Measures ack latencies and
+ * fan-out spread.
  * Run the server with TIMER_SCALE=0.2 first, then:
  *   node scripts/load.cjs [N=300]
  * (All clients share this one Node process, so the numbers are conservative —
@@ -73,33 +74,29 @@ async function spawnClients(count, namePrefix, arenaId, latencies) {
     `round ${round}`
   );
 
-  // --- WAITING under load: a wave of late joiners lands mid-question -----
-  // (past the 2s join-start grace window, so they genuinely count as late)
+  // --- LATE WAVE under load: a wave joins mid-question and lands directly
+  // on the live question — no waiting phase --------------------------------
   await sleep(2500);
   const late = await spawnClients(LATE, "Late", arenaId);
-  const remaining = questions[0].endsAt - Date.now();
   check(
-    `${LATE} late joiners all put in 'waiting' (no question leaked)`,
-    late.every((c) => c.snap.waiting && !c.snap.question && c.snap.round === round)
-  );
-  check(
-    "waiting timer spans rest of question + result (until next question)",
-    late.every((c) => c.snap.waitMs > remaining - 500 && c.snap.waitMs < remaining + 16000),
-    `waitMs ≈ ${late[0].snap.waitMs} (remaining ${remaining})`
-  );
-  let leakedResults = 0;
-  late.forEach((c) =>
-    c.s.on("arena:result", (p) => {
-      if (p.round === round) leakedResults++;
-    })
+    `${LATE} late joiners land directly on the live question (round ${round})`,
+    late.every(
+      (c) =>
+        c.snap.phase === "question" &&
+        c.snap.question &&
+        c.snap.round === round &&
+        !c.snap.waiting
+    )
   );
 
-  // --- everyone in the round answers at a random moment ------------------
+  // --- everyone in the round (main + late) answers at a random moment ----
+  const answerers = [...clients, ...late.map((c) => c.s)];
+  const TOTAL = answerers.length;
   const dur = questions[0].durationMs;
   const ansLat = [];
   let accepted = 0;
   await Promise.all(
-    clients.map(async (s, i) => {
+    answerers.map(async (s, i) => {
       await sleep(Math.random() * (dur - (Date.now() - (questions[0].endsAt - dur))) * 0.6);
       const t = Date.now();
       const r = await call(s, "arena:answer", { round, selectedOption: i % 4 });
@@ -107,11 +104,11 @@ async function spawnClients(count, namePrefix, arenaId, latencies) {
       if (r.ok) accepted++;
     })
   );
-  console.log(`answers: ${accepted}/${N} accepted · ack ${stats(ansLat)}`);
+  console.log(`answers: ${accepted}/${TOTAL} accepted · ack ${stats(ansLat)}`);
 
-  // --- result fan-out -----------------------------------------------------
+  // --- result fan-out (main + late all played this round) ----------------
   const recv = await Promise.all(
-    clients.map((s) => once(s, "arena:result").then((p) => ({ at: Date.now(), p })))
+    answerers.map((s) => once(s, "arena:result").then((p) => ({ at: Date.now(), p })))
   );
   const times = recv.map((r) => r.at);
   const spread = Math.max(...times) - Math.min(...times);
@@ -122,7 +119,7 @@ async function spawnClients(count, namePrefix, arenaId, latencies) {
     .filter((r) => r.p.outcome === "correct")
     .every((r) => Number.isInteger(r.p.yourRank));
   console.log(
-    `result round ${recv[0].p.round}: all ${N} · spread ${spread}ms · ${lateness}ms after scheduled end`
+    `result round ${recv[0].p.round}: all ${TOTAL} · spread ${spread}ms · ${lateness}ms after scheduled end`
   );
   check(
     `graph capped (≤51) with per-user rank — ${correctCount} correct answerers`,
@@ -130,32 +127,30 @@ async function spawnClients(count, namePrefix, arenaId, latencies) {
     `biggest graph ${maxGraph}`
   );
 
-  // --- late joiners enter exactly at the next question --------------------
-  const nextQs = await Promise.all([
-    ...clients.map((s) => once(s, "arena:question")),
-    ...late.map((c) => once(c.s, "arena:question")),
-  ]);
+  // --- the next round reaches the whole crowd in sync --------------------
+  const nextQs = await Promise.all(
+    answerers.map((s) => once(s, "arena:question"))
+  );
   check(
-    `next round reaches all ${N + LATE} (main + late) with identical endsAt`,
+    `next round reaches all ${TOTAL} (main + late) with identical endsAt`,
     nextQs.every((q) => q.round === round + 1 && q.endsAt === nextQs[0].endsAt)
   );
-  check("waiting users got NO result of the round they didn't play", leakedResults === 0);
-  let lateAccepted = 0;
+  let nextAccepted = 0;
   await Promise.all(
-    late.map(async (c, i) => {
-      const r = await call(c.s, "arena:answer", { round: round + 1, selectedOption: i % 4 });
-      if (r.ok) lateAccepted++;
+    answerers.map(async (s, i) => {
+      const r = await call(s, "arena:answer", { round: round + 1, selectedOption: i % 4 });
+      if (r.ok) nextAccepted++;
     })
   );
   check(
-    `all ${LATE} former waiters can answer the new round`,
-    lateAccepted === LATE,
-    `${lateAccepted}/${LATE}`
+    `all ${TOTAL} can answer the new round`,
+    nextAccepted === TOTAL,
+    `${nextAccepted}/${TOTAL}`
   );
 
   clients.forEach((s) => s.close());
   late.forEach((c) => c.s.close());
-  const ok = failures === 0 && accepted === N && spread < 2000;
+  const ok = failures === 0 && accepted === TOTAL && spread < 2000;
   console.log(ok ? "\nLOAD TEST PASS" : "\nLOAD TEST FAIL");
   process.exit(ok ? 0 : 1);
 })().catch((e) => {
