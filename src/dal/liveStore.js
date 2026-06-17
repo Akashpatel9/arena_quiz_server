@@ -1,18 +1,18 @@
 import Redis from "ioredis";
 import { REDIS_URL } from "../config/env.js";
-
-// Live-round answers expire on their own if a flush never happens
-// (e.g. the arena went idle, or every server died mid-round).
-const ANSWER_TTL_MS = 30 * 60 * 1000;
-// Bot counts are touched on every drift step; arenas that stop drifting
-// (deactivated, server gone) age out instead of leaking keys.
-const BOTS_TTL_MS = 24 * 60 * 60 * 1000;
-// When an arena empties of real users the game goes idle; the idle key then
-// ages out after this window so abandoned arenas don't keep state in Redis
-// forever. A player returning within the window resumes the same game (round
-// continuity); after it, a fresh game starts from round 0. The bots key is
-// independent and untouched.
-const IDLE_GAME_TTL_MS = 10 * 60 * 1000;
+import {
+  ANSWER_TTL_MS,
+  BOTS_TTL_MS,
+  IDLE_GAME_TTL_MS,
+} from "../constants/redis.js";
+import {
+  gameKey,
+  onlineKey,
+  botsKey,
+  answersKey,
+  GAME_KEY_PATTERN,
+  ONLINE_KEY_PATTERN,
+} from "../constants/redisKeys.js";
 
 /**
  * Redis is the database for everything LIVE; Mongo keeps durable history.
@@ -67,12 +67,6 @@ export function createLiveStore() {
   redis.on("end", () => {
     healthy = false;
   });
-
-  const gameKey = (arenaGroupId) => `arena:{${arenaGroupId}}:game`;
-  const onlineKey = (arenaGroupId) => `arena:{${arenaGroupId}}:online`;
-  const botsKey = (arenaGroupId) => `arena:{${arenaGroupId}}:bots`;
-  const answersKey = (arenaGroupId, round) =>
-    `arena:{${arenaGroupId}}:r${round}:answers`;
 
   // Stored JSON keeps timestamps as epoch-ms; hydrated objects expose Dates
   // so the engine can keep using .getTime() everywhere.
@@ -157,7 +151,7 @@ export function createLiveStore() {
         const [next, batch] = await redis.scan(
           cursor,
           "MATCH",
-          "arena:*:game",
+          GAME_KEY_PATTERN,
           "COUNT",
           100
         );
@@ -213,7 +207,7 @@ export function createLiveStore() {
         const [next, batch] = await redis.scan(
           cursor,
           "MATCH",
-          "arena:*:online",
+          ONLINE_KEY_PATTERN,
           "COUNT",
           100
         );

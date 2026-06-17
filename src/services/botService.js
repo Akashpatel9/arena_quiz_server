@@ -1,6 +1,21 @@
-import AuthUser from "../models/AuthUser.js";
-import ArenaGroup from "../models/ArenaGroupModel.js";
-import { arenaRoom } from "./gameEngine.js";
+import {
+  listActiveArenaIds,
+  bulkSetOnlineCounts,
+} from "../dal/arenaGroupDao.js";
+import {
+  upsertBotUsers,
+  findBotUsersByGoogleIds,
+  findUsersByGoogleIds,
+} from "../dal/userDao.js";
+import { arenaRoom } from "../utils/rooms.js";
+import { ARENA_ONLINE } from "../constants/socketEvents.js";
+import { botProfiles, toPoolEntries } from "../utils/botProfiles.js";
+import {
+  randomInt,
+  wrongOption,
+  hashSeed,
+  shuffledIndices,
+} from "../utils/random.js";
 import {
   BOT_MIN_PER_ARENA,
   BOT_MAX_PER_ARENA,
@@ -8,8 +23,7 @@ import {
   BOT_DRIFT_MAX_STEP,
   BOT_ACCURACY,
   BOT_TIME_FRACTION,
-  BOT_POOL_SIZE,
-} from "../config/gameConstants.js";
+} from "../constants/bot.js";
 
 // How often the set of active arenas is re-read from Mongo.
 const ARENA_REFRESH_MS = 60_000;
@@ -142,7 +156,7 @@ export function createBotService(io, liveStore) {
       await liveStore.setBotCount(id, next);
 
       const humans = await liveStore.getOnline(id);
-      io.to(arenaRoom(id)).emit("arena:online", {
+      io.to(arenaRoom(id)).emit(ARENA_ONLINE, {
         count: humans + next,
         humans,
         bots: next,
@@ -156,15 +170,12 @@ export function createBotService(io, liveStore) {
     }
     // Lobby display only — Redis stays authoritative.
     if (lobbyUpdates.length) {
-      await ArenaGroup.bulkWrite(lobbyUpdates, { ordered: false }).catch(
-        () => {}
-      );
+      await bulkSetOnlineCounts(lobbyUpdates).catch(() => {});
     }
   }
 
   async function refreshArenas() {
-    const groups = await ArenaGroup.find({ status: 1 }).select("_id").lean();
-    arenaIds = groups.map((g) => String(g._id));
+    arenaIds = await listActiveArenaIds();
   }
 
   /**
@@ -182,53 +193,7 @@ export function createBotService(io, liveStore) {
   return { start, stop, onQuestionStarted, botCount };
 }
 
-// ------------------------------------------------------------ bot profiles
-
-const FIRST_NAMES = [
-  "Aarav", "Vivaan", "Aditya", "Arjun", "Reyansh", "Krishna", "Ishaan",
-  "Shaurya", "Atharv", "Kabir", "Ananya", "Diya", "Aadhya", "Saanvi",
-  "Pari", "Anika", "Navya", "Myra", "Ira", "Riya", "Rohan", "Karan",
-  "Nikhil", "Siddharth", "Pranav", "Tanvi", "Sneha", "Pooja", "Kavya",
-  "Meera", "Dev", "Yash",
-];
-const LAST_NAMES = [
-  "Sharma", "Verma", "Gupta", "Patel", "Singh", "Kumar", "Reddy", "Nair",
-  "Iyer", "Joshi", "Mehta", "Agarwal", "Chauhan", "Mishra", "Das", "Bose",
-  "Kulkarni", "Rao", "Pandey", "Malhotra",
-];
-/**
- * The deterministic list of bot identities — generated from a fixed seed, so
- * the script and the server always agree on the same googleIds/names/photos.
- * This touches no database.
- */
-function botProfiles() {
-  const rand = mulberry32(0xb07_5eed);
-  return Array.from({ length: BOT_POOL_SIZE }, (_, i) => {
-    const name = `${pick(FIRST_NAMES, rand)} ${pick(LAST_NAMES, rand)}`;
-    return {
-      googleId: `arena-bot-${i}`,
-      email: `arena-bot-${i}@bots.arena.local`,
-      name,
-      photo: `https://i.pravatar.cc/150?img=${(i % 70) + 1}`,
-    };
-  });
-}
-
-/** Map auth_user docs to the lightweight pool entries the service uses. */
-function toPoolEntries(profiles, docs) {
-  const byGoogleId = new Map(docs.map((d) => [d.googleId, d]));
-  return profiles
-    .map((p) => {
-      const doc = byGoogleId.get(p.googleId);
-      if (!doc) return null;
-      return {
-        userId: String(doc._id),
-        name: doc.name || p.name,
-        photo: doc.profilePicture || p.photo,
-      };
-    })
-    .filter(Boolean);
-}
+// ------------------------------------------------------------ provisioning
 
 /**
  * Create (upsert) the shared pool of bot users in Mongo. This is a deliberate
@@ -237,30 +202,8 @@ function toPoolEntries(profiles, docs) {
  */
 export async function createBotPool() {
   const profiles = botProfiles();
-  await AuthUser.bulkWrite(
-    profiles.map((p) => ({
-      updateOne: {
-        filter: { googleId: p.googleId },
-        update: {
-          $setOnInsert: {
-            googleId: p.googleId,
-            email: p.email,
-            name: p.name,
-            profilePicture: p.photo,
-            isBot: true,
-          },
-        },
-        upsert: true,
-      },
-    })),
-    { ordered: false }
-  );
-
-  const docs = await AuthUser.find({
-    googleId: { $in: profiles.map((p) => p.googleId) },
-  })
-    .select("_id googleId name profilePicture")
-    .lean();
+  await upsertBotUsers(profiles);
+  const docs = await findUsersByGoogleIds(profiles.map((p) => p.googleId));
   return toPoolEntries(profiles, docs);
 }
 
@@ -271,55 +214,6 @@ export async function createBotPool() {
  */
 async function loadBotPool() {
   const profiles = botProfiles();
-  const docs = await AuthUser.find({
-    isBot: true,
-    googleId: { $in: profiles.map((p) => p.googleId) },
-  })
-    .select("_id googleId name profilePicture")
-    .lean();
+  const docs = await findBotUsersByGoogleIds(profiles.map((p) => p.googleId));
   return toPoolEntries(profiles, docs);
-}
-
-// ----------------------------------------------------------------- helpers
-
-const randomInt = (min, max) =>
-  Math.floor(Math.random() * (max - min + 1)) + min;
-
-const pick = (arr, rand) => arr[Math.floor(rand() * arr.length)];
-
-function wrongOption(correctOption) {
-  const wrong = [0, 1, 2, 3].filter((o) => o !== correctOption);
-  return wrong[Math.floor(Math.random() * wrong.length)];
-}
-
-/** Deterministic seedable PRNG — same seed, same sequence, on any server. */
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function hashSeed(str) {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-/** Fisher–Yates with a seeded PRNG: a stable per-arena ordering. */
-function shuffledIndices(n, seed) {
-  const rand = mulberry32(seed);
-  const order = Array.from({ length: n }, (_, i) => i);
-  for (let i = n - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [order[i], order[j]] = [order[j], order[i]];
-  }
-  return order;
 }

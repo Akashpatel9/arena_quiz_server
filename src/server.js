@@ -4,10 +4,10 @@ import { connectDB } from "./config/db.js";
 import { PORT, RESET_ONLINE_COUNTS, BOTS_ENABLED } from "./config/env.js";
 import { createApp } from "./app.js";
 import { createGameEngine } from "./services/gameEngine.js";
-import { createLiveStore } from "./services/liveStore.js";
+import { createLiveStore } from "./dal/liveStore.js";
 import { createBotService } from "./services/botService.js";
 import { registerArenaSockets } from "./sockets/arenaSocket.js";
-import ArenaGroup from "./models/ArenaGroupModel.js";
+import { resetAllOnlineCounts } from "./dal/arenaGroupDao.js";
 
 async function main() {
   await connectDB();
@@ -23,7 +23,7 @@ async function main() {
     // After a crash the counters can be stale (disconnects never ran).
     // Single-server only — disable via env when running multiple instances.
     await liveStore.resetOnlineCounts();
-    await ArenaGroup.updateMany({}, { $set: { online_user_count: 0 } });
+    await resetAllOnlineCounts();
   }
 
   const app = createApp(liveStore);

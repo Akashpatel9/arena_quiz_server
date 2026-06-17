@@ -2,6 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { createArenaRoutes } from "./routes/arenaRoutes.js";
+import { errorHandler } from "./middleware/errorHandler.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,10 +18,7 @@ export function createApp(liveStore) {
   // Minimal browser client for manual testing (public/index.html).
   app.use(express.static(path.join(__dirname, "..", "public")));
 
-  app.use((err, _req, res, _next) => {
-    console.error("[http] error:", err);
-    res.status(500).json({ ok: false, message: "Internal server error" });
-  });
+  app.use(errorHandler);
 
   return app;
 }

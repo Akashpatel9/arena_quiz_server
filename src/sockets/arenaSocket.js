@@ -1,8 +1,18 @@
-import crypto from "node:crypto";
 import mongoose from "mongoose";
-import AuthUser from "../models/AuthUser.js";
-import ArenaGroup from "../models/ArenaGroupModel.js";
-import { arenaRoom } from "../services/gameEngine.js";
+import { findArenaById, setOnlineCount } from "../dal/arenaGroupDao.js";
+import { arenaRoom } from "../utils/rooms.js";
+import { expectedError as expected } from "../utils/expectedError.js";
+import { socketAuth } from "../middleware/socketAuth.js";
+import {
+  CONNECTION,
+  DISCONNECT,
+  SESSION,
+  ARENA_ONLINE,
+  ARENA_JOIN,
+  ARENA_ANSWER,
+  ARENA_SYNC,
+  ARENA_LEAVE,
+} from "../constants/socketEvents.js";
 
 /**
  * Socket protocol (all client→server events take an ack callback):
@@ -27,19 +37,19 @@ import { arenaRoom } from "../services/gameEngine.js";
  * purely for lobby display.
  */
 export function registerArenaSockets(io, engine, liveStore) {
-  io.use(authMiddleware);
+  io.use(socketAuth);
 
-  io.on("connection", (socket) => {
-    socket.emit("session", {
+  io.on(CONNECTION, (socket) => {
+    socket.emit(SESSION, {
       userId: socket.data.userId,
       name: socket.data.name,
     });
 
-    socket.on("arena:join", (payload, ack) =>
+    socket.on(ARENA_JOIN, (payload, ack) =>
       safeHandler(ack, () => handleJoin(socket, payload))
     );
 
-    socket.on("arena:answer", (payload, ack) =>
+    socket.on(ARENA_ANSWER, (payload, ack) =>
       safeHandler(ack, async () => {
         if (!socket.data.arenaGroupId) {
           throw expected("NOT_IN_ARENA", "Join an arena first");
@@ -57,7 +67,7 @@ export function registerArenaSockets(io, engine, liveStore) {
       })
     );
 
-    socket.on("arena:sync", (_payload, ack) =>
+    socket.on(ARENA_SYNC, (_payload, ack) =>
       safeHandler(ack, async () => {
         const arenaGroupId = socket.data.arenaGroupId;
         if (!arenaGroupId) throw expected("NOT_IN_ARENA", "Join an arena first");
@@ -66,14 +76,14 @@ export function registerArenaSockets(io, engine, liveStore) {
       })
     );
 
-    socket.on("arena:leave", (_payload, ack) =>
+    socket.on(ARENA_LEAVE, (_payload, ack) =>
       safeHandler(ack, async () => {
         await leaveArena(socket);
         return { ok: true };
       })
     );
 
-    socket.on("disconnect", () => {
+    socket.on(DISCONNECT, () => {
       leaveArena(socket).catch((e) =>
         console.error("[socket] disconnect cleanup failed:", e.message)
       );
@@ -85,7 +95,7 @@ export function registerArenaSockets(io, engine, liveStore) {
     if (!mongoose.isValidObjectId(arenaGroupId)) {
       throw expected("BAD_ARENA", "arenaGroupId is not a valid id");
     }
-    const group = await ArenaGroup.findById(arenaGroupId);
+    const group = await findArenaById(arenaGroupId);
     if (!group || group.status !== 1) {
       throw expected("BAD_ARENA", "Arena not found or not active");
     }
@@ -123,49 +133,13 @@ export function registerArenaSockets(io, engine, liveStore) {
     // check keeps reading the human-only counter.
     const bots = await liveStore.getBotCount(arenaGroupId);
     const count = humans + bots;
-    io.to(arenaRoom(arenaGroupId)).emit("arena:online", {
+    io.to(arenaRoom(arenaGroupId)).emit(ARENA_ONLINE, {
       count,
       humans,
       bots,
     });
     // Lobby display only — Redis is the authoritative count.
-    ArenaGroup.updateOne(
-      { _id: arenaGroupId },
-      { $set: { online_user_count: count } }
-    ).catch(() => {});
-  }
-}
-
-/**
- * Resolve the player for this connection. Clients pass { userId, name } in
- * `socket.handshake.auth`; an unknown/missing userId gets a guest account
- * (the client must persist the userId from the `session` event to stay the
- * same player across reconnects).
- *
- * NOTE: this is intentionally permissive for development. Production should
- * verify a signed token (e.g. the Google-login JWT) here instead.
- */
-async function authMiddleware(socket, next) {
-  try {
-    const { userId, name } = socket.handshake.auth || {};
-    let user = null;
-    if (userId && mongoose.isValidObjectId(userId)) {
-      user = await AuthUser.findById(userId);
-    }
-    if (!user) {
-      const uid = crypto.randomUUID();
-      user = await AuthUser.create({
-        googleId: `guest-${uid}`,
-        email: `guest-${uid}@arena.local`,
-        name: name?.trim() || `Guest-${uid.slice(0, 5)}`,
-      });
-    }
-    socket.data.userId = String(user._id);
-    socket.data.name = user.name || "Player";
-    socket.data.photo = user.profilePicture || "";
-    next();
-  } catch (e) {
-    next(e);
+    setOnlineCount(arenaGroupId, count).catch(() => {});
   }
 }
 
@@ -182,11 +156,4 @@ async function safeHandler(ack, fn) {
       message: e.expected ? e.message : "Something went wrong",
     });
   }
-}
-
-function expected(code, message) {
-  const e = new Error(message);
-  e.code = code;
-  e.expected = true;
-  return e;
 }

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import mongoose from "mongoose";
-import ArenaGroup from "../models/ArenaGroupModel.js";
+import { listActiveArenas } from "../dal/arenaGroupDao.js";
 
 export function createArenaRoutes(liveStore) {
   const router = Router();
@@ -8,7 +8,7 @@ export function createArenaRoutes(liveStore) {
   // Active arenas a user can join.
   router.get("/arena-groups", async (_req, res, next) => {
     try {
-      const groups = await ArenaGroup.find({ status: 1 }).lean();
+      const groups = await listActiveArenas();
       res.json({ ok: true, data: groups });
     } catch (e) {
       next(e);

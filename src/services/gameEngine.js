@@ -1,18 +1,15 @@
-import ArenaGroup from "../models/ArenaGroupModel.js";
-import Question from "../models/Question.js";
-import {
-  pickQuestion,
-  sanitizeQuestion,
-  solutionImagesOf,
-} from "./questionService.js";
+import { findArenaById } from "../dal/arenaGroupDao.js";
+import { findQuestionById, pickQuestion } from "../dal/questionDao.js";
+import { sanitizeQuestion, solutionImagesOf } from "../utils/questionView.js";
+import { arenaRoom } from "../utils/rooms.js";
+import { expectedError } from "../utils/expectedError.js";
+import { ARENA_QUESTION, ARENA_RESULT } from "../constants/socketEvents.js";
 import {
   questionDurationFor,
   RESULT_DURATION_MS,
   ANSWER_GRACE_MS,
   GRAPH_TOP_LIMIT,
-} from "../config/gameConstants.js";
-
-export const arenaRoom = (arenaGroupId) => `arena:${arenaGroupId}`;
+} from "../constants/game.js";
 
 /**
  * Drives the question → result → question loop for every arena.
@@ -45,13 +42,6 @@ export function createGameEngine(io, liveStore, hooks = {}) {
   const lastAnnounced = new Map();
   /** arenaGroupId -> last known game state (valid until its phase boundary) */
   const gameCache = new Map();
-
-  setInterval(()=>{
-    console.log("gameCache====>>>>",gameCache)
-    console.log("lastAnnounced====>>>>",lastAnnounced)
-    console.log("timers====>>>>",timers)
-
-  },3000)
 
   // ---------------------------------------------------------------- public
 
@@ -382,7 +372,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     if (game.phase === "question") {
       const question = await getQuestionFor(game);
       if (!question) return;
-      io.to(arenaRoom(game.arenaGroupId)).emit("arena:question", {
+      io.to(arenaRoom(game.arenaGroupId)).emit(ARENA_QUESTION, {
         serverTime: Date.now(),
         round: game.round,
         question: sanitizeQuestion(question),
@@ -402,7 +392,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     for (const socket of sockets) {
       const { userId } = socket.data;
       if (!userId) continue;
-      socket.emit("arena:result", personalizeResult(results, userId));
+      socket.emit(ARENA_RESULT, personalizeResult(results, userId));
     }
   }
 
@@ -504,7 +494,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
   /** The current round's question, loaded from Mongo by its id. */
   async function getQuestionFor(game) {
     if (!game.questionId) return null;
-    return Question.findById(game.questionId);
+    return findQuestionById(game.questionId);
   }
 
   /** Remember the latest game state for getGameCached; passes `game` through. */
@@ -538,18 +528,13 @@ export function createGameEngine(io, liveStore, hooks = {}) {
    */
   async function filterFor(game) {
     if (game.filter) return game.filter;
-    const group = await ArenaGroup.findById(game.arenaGroupId);
+    const group = await findArenaById(game.arenaGroupId);
     return group?.filter ?? {};
   }
 
   // An expected (rule-violation) error: `expected` tells the socket layer to
   // return { code, message } to the client instead of logging it as a crash.
-  function err(code, message) {
-    const e = new Error(message);
-    e.code = code;
-    e.expected = true;
-    return e;
-  }
+  const err = expectedError;
 
   /** Cancel every pending phase timer (server shutdown). */
   function stop() {
