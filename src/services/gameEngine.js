@@ -5,6 +5,7 @@ import { arenaRoom } from "../utils/rooms.js";
 import { expectedError } from "../utils/expectedError.js";
 import { ARENA_QUESTION, ARENA_RESULT } from "../constants/socketEvents.js";
 import { buildResults, personalizeResult } from "./resultBuilder.js";
+import { validateSelectedOption, buildAnswerRecord } from "./answerBuilder.js";
 import {
   questionDurationFor,
   RESULT_DURATION_MS,
@@ -147,13 +148,8 @@ export function createGameEngine(io, liveStore, hooks = {}) {
    * No database round-trips while the question is live.
    */
   async function submitAnswer({ arenaGroupId, user, round, selectedOption }) {
-    if (
-      !Number.isInteger(selectedOption) ||
-      selectedOption < 0 ||
-      selectedOption > 3
-    ) {
-      throw err("BAD_OPTION", "selectedOption must be an integer 0..3");
-    }
+    validateSelectedOption(selectedOption);
+
     const game = await getGameCached(arenaGroupId);
     if (!game || game.status !== "running" || game.phase !== "question") {
       throw err("NOT_ACCEPTING", "No question is live right now");
@@ -169,22 +165,14 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     const question = await getQuestionFor(game);
     if (!question) throw err("NOT_ACCEPTING", "Question unavailable");
 
-    const timeTakenMs = Math.min(
-      Math.max(0, now - game.phaseStartedAt.getTime()),
-      game.questionDurationMs ?? now - game.phaseStartedAt.getTime()
-    );
-    const answer = {
-      arenaGroupId: String(arenaGroupId),
-      round: game.round,
-      questionId: String(game.questionId),
-      userId: String(user.userId),
-      userName: user.name || "",
-      userPhoto: user.photo || "",
+    const answer = buildAnswerRecord({
+      arenaGroupId,
+      user,
+      game,
+      question,
       selectedOption,
-      correct: selectedOption === question.correctOption,
-      timeTakenMs,
-      answeredAt: new Date(now).toISOString(),
-    };
+      now,
+    });
 
     // Answers live only in Redis (one round at a time). Redis is the live
     // database, so if it's down the game isn't really running — reject rather
@@ -197,7 +185,12 @@ export function createGameEngine(io, liveStore, hooks = {}) {
       throw err("ALREADY_ANSWERED", "You already answered this question");
     }
     // Correctness is never revealed before the result screen.
-    return { locked: true, round: game.round, selectedOption, timeTakenMs };
+    return {
+      locked: true,
+      round: game.round,
+      selectedOption,
+      timeTakenMs: answer.timeTakenMs,
+    };
   }
 
   // ----------------------------------------------------------- game loop
