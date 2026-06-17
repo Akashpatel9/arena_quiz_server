@@ -14,17 +14,13 @@
  */
 const { execSync, spawn } = require("node:child_process");
 const path = require("node:path");
+const Redis = require("../node_modules/ioredis");
 const { io } = require("../node_modules/socket.io/client-dist/socket.io.js");
 
 const A = "http://localhost:3000";
 const B = "http://localhost:3001";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const call = (s, ev, p) => new Promise((res) => s.emit(ev, p, res));
-const once = (s, ev, timeoutMs = 60000) =>
-  new Promise((res, rej) => {
-    const t = setTimeout(() => rej(new Error(`timeout ${ev}`)), timeoutMs);
-    s.once(ev, (p) => (clearTimeout(t), res(p)));
-  });
 const state = (base) =>
   fetch(`${base}/api/arena-groups/${ARENA}/state`).then((r) => r.json());
 
@@ -49,8 +45,35 @@ const mk = (base, name, userId) =>
     s.once("connect_error", rej);
   });
 
+// Wipe an arena's live keys straight from Redis so the suite starts from a
+// known idle state — the server exposes no reset endpoint, and back-to-back
+// runs would otherwise see the arena still running from the previous run.
+async function clearArena(id) {
+  const redis = new Redis(process.env.REDIS_URL || "redis://127.0.0.1:6379", {
+    maxRetriesPerRequest: 1,
+    lazyConnect: true,
+  });
+  await redis.connect();
+  const keys = [`arena:{${id}}:game`, `arena:{${id}}:online`];
+  let cursor = "0";
+  do {
+    const [next, batch] = await redis.scan(
+      cursor,
+      "MATCH",
+      `arena:{${id}}:r*:answers`,
+      "COUNT",
+      100
+    );
+    cursor = next;
+    keys.push(...batch);
+  } while (cursor !== "0");
+  if (keys.length) await redis.del(...keys);
+  await redis.quit();
+}
+
 (async () => {
   ARENA = (await fetch(`${A}/api/arena-groups`).then((r) => r.json())).data[0]._id;
+  await clearArena(ARENA);
 
   // ---- 1. simultaneous first joins on an empty arena -------------------
   const before = (await state(A)).data;
@@ -113,45 +136,62 @@ const mk = (base, name, userId) =>
 
   const ca = await mk(A, "OnServerA");
   const cb = await mk(B, "OnServerB");
-  const seenA = new Map(); // round -> count of question events
-  const seenB = new Map();
-  ca.s.on("arena:question", (q) => seenA.set(q.round, (seenA.get(q.round) || 0) + 1));
-  cb.s.on("arena:question", (q) => seenB.set(q.round, (seenB.get(q.round) || 0) + 1));
+
+  // Record EVERY broadcast with persistent listeners — no `once` re-arm gap
+  // between phases that could silently drop a question event and make the
+  // engine look like it skipped a round. qX: first question payload per round;
+  // seenX: raw event count per round (to catch a genuine double-announce);
+  // rX: result payload per round. Each client auto-answers every question it
+  // sees, so results have content.
+  const qA = new Map(), qB = new Map(), rA = new Map(), rB = new Map();
+  const seenA = new Map(), seenB = new Map();
+  const onQuestion = (qMap, seen, sock, opt) => (q) => {
+    seen.set(q.round, (seen.get(q.round) || 0) + 1);
+    if (!qMap.has(q.round)) {
+      qMap.set(q.round, q);
+      sock.emit("arena:answer", { round: q.round, selectedOption: opt(q.round) });
+    }
+  };
+  ca.s.on("arena:question", onQuestion(qA, seenA, ca.s, (r) => r % 4));
+  cb.s.on("arena:question", onQuestion(qB, seenB, cb.s, (r) => (r + 1) % 4));
+  ca.s.on("arena:result", (r) => rA.set(r.round, r));
+  cb.s.on("arena:result", (r) => rB.set(r.round, r));
+
   await call(ca.s, "arena:join", { arenaGroupId: ARENA });
   await call(cb.s, "arena:join", { arenaGroupId: ARENA });
 
-  const transcript = [];
-  for (let i = 0; i < 3; i++) {
-    const [qa, qb] = await Promise.all([
-      once(ca.s, "arena:question"),
-      once(cb.s, "arena:question"),
-    ]);
-    transcript.push({ qa, qb });
-    // both answer so results have content
-    await Promise.all([
-      call(ca.s, "arena:answer", { round: qa.round, selectedOption: i % 4 }),
-      call(cb.s, "arena:answer", { round: qb.round, selectedOption: (i + 1) % 4 }),
-    ]);
-    const [ra, rb] = await Promise.all([
-      once(ca.s, "arena:result"),
-      once(cb.s, "arena:result"),
-    ]);
-    transcript[i].ra = ra;
-    transcript[i].rb = rb;
+  // Wait for a run of 3 consecutive rounds with results on BOTH servers. One
+  // cycle is question(12s)+result(3s)=15s under TIMER_SCALE=0.2.
+  const commonRounds = () =>
+    [...qA.keys()]
+      .filter((r) => qB.has(r) && rA.has(r) && rB.has(r))
+      .sort((a, b) => a - b);
+  const consecutive = (xs, n) => {
+    for (let i = 0; i + n <= xs.length; i++) {
+      const w = xs.slice(i, i + n);
+      if (w.every((v, j) => j === 0 || v === w[j - 1] + 1)) return w;
+    }
+    return null;
+  };
+  let window = null;
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline && !(window = consecutive(commonRounds(), 3))) {
+    await sleep(500);
   }
+  if (!window) throw new Error("never saw 3 consecutive rounds on both servers");
 
   check(
     "clients on both servers see identical rounds + endsAt",
-    transcript.every(
-      ({ qa, qb }) => qa.round === qb.round && qa.endsAt === qb.endsAt
-    ),
-    transcript.map(({ qa }) => qa.round).join(" → ")
+    window.every((r) => qA.get(r).endsAt === qB.get(r).endsAt),
+    window.join(" → ")
   );
+  // Server A sees every broadcast (persistent listener), so its captured
+  // rounds must be a gap-free run — the engine never skips a round.
+  const roundsA = [...qA.keys()].sort((a, b) => a - b);
   check(
     "rounds advance strictly by 1 (each CAS won exactly once)",
-    transcript.every(
-      ({ qa }, i) => i === 0 || qa.round === transcript[i - 1].qa.round + 1
-    )
+    roundsA.every((v, i) => i === 0 || v === roundsA[i - 1] + 1),
+    roundsA.join(" → ")
   );
   check(
     "no double-announced question on either server",
@@ -160,7 +200,7 @@ const mk = (base, name, userId) =>
   );
   check(
     "identical results across servers (correctOption matches)",
-    transcript.every(({ ra, rb }) => ra.correctOption === rb.correctOption)
+    window.every((r) => rA.get(r).correctOption === rB.get(r).correctOption)
   );
 
   // ---- 4. join/leave churn keeps the online counter honest -------------
