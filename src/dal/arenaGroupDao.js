@@ -11,9 +11,12 @@ export function listActiveArenas() {
   return ArenaGroup.find({ status: 1 }).lean();
 }
 
-/** A single arena document by id (Mongoose doc, not lean). */
+/**
+ * A single arena document by id. Lean: callers only read fields (status,
+ * filter) and never mutate/save the doc, so skip Mongoose hydration.
+ */
 export function findArenaById(id) {
-  return ArenaGroup.findById(id);
+  return ArenaGroup.findById(id).lean();
 }
 
 /** Ids of every active arena (bot population / refresh). */

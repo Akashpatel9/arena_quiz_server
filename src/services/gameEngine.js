@@ -291,6 +291,10 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     cacheGame(current);
     await announce(current);
     scheduleNext(current);
+    // The arena went idle (emptied, or no questions matched its filter) — drop
+    // its per-arena bookkeeping so abandoned arenas don't leak memory. The next
+    // joiner re-creates it via ensureRunning.
+    if (current.status !== "running") forgetArena(current.arenaGroupId);
   }
 
   /**
@@ -437,10 +441,23 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     return game;
   }
 
+  /** Drop all per-arena bookkeeping (called when an arena goes idle). */
+  function forgetArena(arenaGroupId) {
+    const key = String(arenaGroupId);
+    gameCache.delete(key);
+    lastAnnounced.delete(key);
+  }
+
   /**
    * The game state can only change at a phase boundary, so between
    * boundaries the cached copy is authoritative — no Redis read per answer.
    * Anything idle, missing or past its boundary is re-read from Redis.
+   *
+   * Note: the validity window extends ANSWER_GRACE_MS past phaseEndsAt, so for
+   * up to that grace period this can return a "question"-phase game whose phase
+   * has technically already rolled over to "result" in Redis. That's
+   * deliberate — it lets a late-but-in-grace answer still be accepted against
+   * the question it was answering.
    */
   async function getGameCached(arenaGroupId) {
     const cached = gameCache.get(String(arenaGroupId));

@@ -21,9 +21,11 @@ export function createArenaRoutes(liveStore) {
       if (!mongoose.isValidObjectId(req.params.id)) {
         return res.status(400).json({ ok: false, message: "Bad arena id" });
       }
-      const game = await liveStore.getGame(req.params.id);
-      const humans = await liveStore.getOnline(req.params.id);
-      const bots = await liveStore.getBotCount(req.params.id);
+      const [game, humans, bots] = await Promise.all([
+        liveStore.getGame(req.params.id),
+        liveStore.getOnline(req.params.id),
+        liveStore.getBotCount(req.params.id),
+      ]);
       const counts = { online: humans + bots, humans, bots };
       res.json({
         ok: true,

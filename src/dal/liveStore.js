@@ -200,6 +200,18 @@ export function createLiveStore() {
       return Number(raw) || 0;
     },
 
+    /**
+     * Online counts for many arenas in one round-trip (MGET). Returns a Map of
+     * arenaGroupId -> count, defaulting absent/unset keys to 0.
+     */
+    async getOnlineMany(arenaGroupIds) {
+      const out = new Map();
+      if (!arenaGroupIds.length) return out;
+      const raws = await redis.mget(arenaGroupIds.map(onlineKey));
+      arenaGroupIds.forEach((id, i) => out.set(id, Number(raws[i]) || 0));
+      return out;
+    },
+
     /** Zero all online counters (single-server boot cleanup). */
     async resetOnlineCounts() {
       let cursor = "0";
@@ -231,6 +243,18 @@ export function createLiveStore() {
 
     async setBotCount(arenaGroupId, count) {
       await redis.set(botsKey(arenaGroupId), count, "PX", BOTS_TTL_MS);
+    },
+
+    /**
+     * Write many bot counts in one pipeline (each with the bots TTL refreshed).
+     * `entries` is an iterable of [arenaGroupId, count].
+     */
+    async setBotCounts(entries) {
+      const pipe = redis.pipeline();
+      for (const [id, count] of entries) {
+        pipe.set(botsKey(id), count, "PX", BOTS_TTL_MS);
+      }
+      await pipe.exec();
     },
 
     /**

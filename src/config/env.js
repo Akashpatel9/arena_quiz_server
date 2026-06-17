@@ -11,6 +11,11 @@ export const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 export const IMAGE_BASE_URL = process.env.IMAGE_BASE_URL
   ? process.env.IMAGE_BASE_URL.replace(/\/+$/, "") + "/"
   : "";
+// Allowed CORS origins for Socket.IO. Comma-separated list, or "*" (default)
+// to allow any origin. Tighten this in production via env.
+export const SOCKET_CORS_ORIGIN = process.env.SOCKET_CORS_ORIGIN
+  ? process.env.SOCKET_CORS_ORIGIN.split(",").map((o) => o.trim()).filter(Boolean)
+  : "*";
 export const RESET_ONLINE_COUNTS =
   (process.env.RESET_ONLINE_COUNTS ?? "true") !== "false";
 // Simulated players in every arena (see services/botService.js).

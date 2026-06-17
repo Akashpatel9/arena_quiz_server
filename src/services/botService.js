@@ -142,7 +142,10 @@ export function createBotService(io, liveStore) {
   /** One random-walk step for every arena's crowd. */
   async function drift() {
     if (!liveStore.isHealthy()) return;
-    const lobbyUpdates = [];
+
+    // Compute every arena's next count first; only the ones that actually
+    // changed need a Redis write, an online read, and a broadcast.
+    const changed = [];
     for (const id of arenaIds) {
       const step = randomInt(-BOT_DRIFT_MAX_STEP, BOT_DRIFT_MAX_STEP);
       if (!step) continue;
@@ -153,9 +156,17 @@ export function createBotService(io, liveStore) {
       );
       if (next === current) continue;
       counts.set(id, next);
-      await liveStore.setBotCount(id, next);
+      changed.push([id, next]);
+    }
+    if (!changed.length) return;
 
-      const humans = await liveStore.getOnline(id);
+    // Two batched round-trips instead of two per changed arena.
+    await liveStore.setBotCounts(changed);
+    const onlineByArena = await liveStore.getOnlineMany(changed.map(([id]) => id));
+
+    const lobbyUpdates = [];
+    for (const [id, next] of changed) {
+      const humans = onlineByArena.get(id) ?? 0;
       io.to(arenaRoom(id)).emit(ARENA_ONLINE, {
         count: humans + next,
         humans,
@@ -176,6 +187,12 @@ export function createBotService(io, liveStore) {
 
   async function refreshArenas() {
     arenaIds = await listActiveArenaIds();
+    // Drop cached counts for arenas that are no longer active so the map can't
+    // grow without bound as arenas come and go.
+    const active = new Set(arenaIds);
+    for (const id of counts.keys()) {
+      if (!active.has(id)) counts.delete(id);
+    }
   }
 
   /**

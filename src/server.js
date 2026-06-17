@@ -1,8 +1,8 @@
 import http from "node:http";
-import { Server } from "socket.io";
 import { connectDB } from "./config/db.js";
 import { PORT, RESET_ONLINE_COUNTS, BOTS_ENABLED } from "./config/env.js";
 import { createApp } from "./app.js";
+import { createSocketServer } from "./config/socket.js";
 import { createGameEngine } from "./services/gameEngine.js";
 import { createLiveStore } from "./dal/liveStore.js";
 import { createBotService } from "./services/botService.js";
@@ -28,9 +28,7 @@ async function main() {
 
   const app = createApp(liveStore);
   const server = http.createServer(app);
-  const io = new Server(server, {
-    cors: { origin: "*" }, // tighten for production
-  });
+  const io = createSocketServer(server);
 
   const bots = BOTS_ENABLED ? createBotService(io, liveStore) : null;
   const engine = createGameEngine(io, liveStore, {
@@ -46,14 +44,22 @@ async function main() {
     console.log(`[server] arena server listening on http://localhost:${PORT}`);
   });
 
-  const shutdown = () => {
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return; // ignore a second SIGINT/SIGTERM
+    shuttingDown = true;
     console.log("[server] shutting down");
+    // Hard cap: exit even if a close() hangs.
+    setTimeout(() => process.exit(0), 3000).unref();
     bots?.stop();
     engine.stop();
-    liveStore.close();
-    io.close();
+    try {
+      await io.close(); // stop accepting connections, flush sockets
+      await liveStore.close(); // clean Redis quit (drains in-flight writes)
+    } catch (e) {
+      console.error("[server] shutdown cleanup error:", e.message);
+    }
     server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 3000).unref();
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
