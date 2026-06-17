@@ -1,14 +1,14 @@
 import { findArenaById } from "../dal/arenaGroupDao.js";
 import { findQuestionById, pickQuestion } from "../dal/questionDao.js";
-import { sanitizeQuestion, solutionImagesOf } from "../utils/questionView.js";
+import { sanitizeQuestion } from "../utils/questionView.js";
 import { arenaRoom } from "../utils/rooms.js";
 import { expectedError } from "../utils/expectedError.js";
 import { ARENA_QUESTION, ARENA_RESULT } from "../constants/socketEvents.js";
+import { buildResults, personalizeResult } from "./resultBuilder.js";
 import {
   questionDurationFor,
   RESULT_DURATION_MS,
   ANSWER_GRACE_MS,
-  GRAPH_TOP_LIMIT,
 } from "../constants/game.js";
 
 /**
@@ -397,88 +397,22 @@ export function createGameEngine(io, liveStore, hooks = {}) {
   }
 
   /**
-   * Build the shared result data for the current round. Pure read — safe to
-   * run on every server and on every reconnect.
+   * Fetch the current round's question and stored answers, then hand them to
+   * the pure result builder. The answer key outlives the result phase
+   * (ANSWER_TTL_MS), so reconnects during the result still recompute it; it's
+   * cleared when the next round starts.
    */
   async function computeResults(game) {
     const question = await getQuestionFor(game);
-    if (!question) return { base: null, byUser: new Map(), graph: [] };
-
-    // Answers live only in Redis, for the current round. The key outlives the
-    // 15s result phase (ANSWER_TTL_MS), so reconnects during the result still
-    // recompute it; it's cleared when the next round starts.
-    const answers = (await liveStore.getAnswers(game.arenaGroupId, game.round)) || [];
-    answers.sort((a, b) => a.timeTakenMs - b.timeTakenMs);
-
-    // The graph: only correct answers, ranked by speed (fastest first).
-    // Each recipient gets at most the top GRAPH_TOP_LIMIT entries (plus
-    // their own, appended in personalizeResult if they placed below the
-    // cap) — this keeps the result fan-out O(players), not O(players²).
-    const ranked = answers
-      .filter((a) => a.correct)
-      .map((a, i) => ({
-        rank: i + 1,
-        userId: String(a.userId),
-        name: a.userName,
-        photo: a.userPhoto || null,
-        timeTakenMs: a.timeTakenMs,
-      }));
-    const graph = ranked.slice(0, GRAPH_TOP_LIMIT);
-    const rankByUser = new Map(ranked.map((g) => [g.userId, g]));
-
-    const byUser = new Map(answers.map((a) => [String(a.userId), a]));
-    const base = {
-      serverTime: Date.now(),
+    const answers = question
+      ? (await liveStore.getAnswers(game.arenaGroupId, game.round)) || []
+      : [];
+    return buildResults({
+      question,
+      answers,
       round: game.round,
-      question: sanitizeQuestion(question),
-      correctOption: question.correctOption,
-      explanation: question.explanation,
-      solutionImages: solutionImagesOf(question),
-      endsAt: game.phaseEndsAt.getTime(),
-      // Result timer is fixed; the next question appears when it ends.
-      nextQuestionAt: game.phaseEndsAt.getTime(),
-    };
-    return { base, byUser, graph, rankByUser };
-  }
-
-  /**
-   * Tailor the shared result to one user: their outcome (correct/wrong/
-   * not_attempted), their own answer, and — only if they were correct —
-   * their rank and the speed graph (with their own entry appended when they
-   * placed below the top-N cap).
-   */
-  function personalizeResult({ base, graph, byUser, rankByUser }, userId) {
-    const answer = byUser.get(String(userId));
-    const outcome = !answer
-      ? "not_attempted"
-      : answer.correct
-        ? "correct"
-        : "wrong";
-
-    // The graph only appears for users who answered correctly. If they
-    // placed below the top-N cap, append their own entry so they always
-    // see their rank.
-    let yourGraph = null;
-    let yourRank = null;
-    if (outcome === "correct") {
-      const own = rankByUser.get(String(userId));
-      yourRank = own?.rank ?? null;
-      yourGraph =
-        own && own.rank > graph.length ? [...graph, own] : graph;
-    }
-
-    return {
-      ...base,
-      outcome,
-      yourAnswer: answer
-        ? {
-            selectedOption: answer.selectedOption,
-            timeTakenMs: answer.timeTakenMs,
-          }
-        : null,
-      yourRank,
-      graph: yourGraph,
-    };
+      endsAtMs: game.phaseEndsAt?.getTime() ?? null,
+    });
   }
 
   // --------------------------------------------------------------- helpers
