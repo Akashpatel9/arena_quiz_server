@@ -1,6 +1,6 @@
 /**
  * Bot service verification over a real round.
- * Run the server with TIMER_SCALE=0.2 first, then: node scripts/bot-test.cjs
+ * Run the server with TIMER_SCALE=0.2 first, then: node tests/bot-test.cjs
  *
  * Asserts the three spec points:
  *  1. population: 10–100 bots in the arena, included in arena:online;

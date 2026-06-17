@@ -46,7 +46,12 @@ export function createBotService(io, liveStore) {
   // ----------------------------------------------------------------- public
 
   async function start() {
-    pool = await ensureBotPool();
+    pool = await loadBotPool();
+    if (!pool.length) {
+      console.warn(
+        "[bots] no bot profiles found in Mongo — run `npm run create:bots` to create them. Arenas will run without bots until then."
+      );
+    }
     await refreshArenas();
     for (const id of arenaIds) {
       const initial = randomInt(BOT_MIN_PER_ARENA, BOT_MAX_PER_ARENA);
@@ -192,13 +197,13 @@ const LAST_NAMES = [
   "Kulkarni", "Rao", "Pandey", "Malhotra",
 ];
 /**
- * Make sure the shared pool of bot users exists in Mongo and return their
- * profiles (with real ObjectIds — answers reference auth_user). Profiles are
- * generated from a fixed seed, so every server upserts the identical pool.
+ * The deterministic list of bot identities — generated from a fixed seed, so
+ * the script and the server always agree on the same googleIds/names/photos.
+ * This touches no database.
  */
-async function ensureBotPool() {
+function botProfiles() {
   const rand = mulberry32(0xb07_5eed);
-  const profiles = Array.from({ length: BOT_POOL_SIZE }, (_, i) => {
+  return Array.from({ length: BOT_POOL_SIZE }, (_, i) => {
     const name = `${pick(FIRST_NAMES, rand)} ${pick(LAST_NAMES, rand)}`;
     return {
       googleId: `arena-bot-${i}`,
@@ -207,7 +212,31 @@ async function ensureBotPool() {
       photo: `https://i.pravatar.cc/150?img=${(i % 70) + 1}`,
     };
   });
+}
 
+/** Map auth_user docs to the lightweight pool entries the service uses. */
+function toPoolEntries(profiles, docs) {
+  const byGoogleId = new Map(docs.map((d) => [d.googleId, d]));
+  return profiles
+    .map((p) => {
+      const doc = byGoogleId.get(p.googleId);
+      if (!doc) return null;
+      return {
+        userId: String(doc._id),
+        name: doc.name || p.name,
+        photo: doc.profilePicture || p.photo,
+      };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Create (upsert) the shared pool of bot users in Mongo. This is a deliberate
+ * one-off provisioning step — run it from the create:bots script, NOT on every
+ * server start. Returns the resulting pool entries.
+ */
+export async function createBotPool() {
+  const profiles = botProfiles();
   await AuthUser.bulkWrite(
     profiles.map((p) => ({
       updateOne: {
@@ -232,15 +261,23 @@ async function ensureBotPool() {
   })
     .select("_id googleId name profilePicture")
     .lean();
-  const byGoogleId = new Map(docs.map((d) => [d.googleId, d]));
-  return profiles.map((p) => {
-    const doc = byGoogleId.get(p.googleId);
-    return {
-      userId: String(doc._id),
-      name: doc.name || p.name,
-      photo: doc.profilePicture || p.photo,
-    };
-  });
+  return toPoolEntries(profiles, docs);
+}
+
+/**
+ * Load the bot pool that already exists in Mongo (created by create:bots).
+ * Read-only — never creates bots — so the server start path makes no decision
+ * about provisioning. Returns whatever subset currently exists (possibly empty).
+ */
+async function loadBotPool() {
+  const profiles = botProfiles();
+  const docs = await AuthUser.find({
+    isBot: true,
+    googleId: { $in: profiles.map((p) => p.googleId) },
+  })
+    .select("_id googleId name profilePicture")
+    .lean();
+  return toPoolEntries(profiles, docs);
 }
 
 // ----------------------------------------------------------------- helpers

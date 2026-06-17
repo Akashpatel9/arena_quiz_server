@@ -273,8 +273,10 @@ export function createGameEngine(io, liveStore, hooks = {}) {
     } else if (game.phase === "result") {
       const online = await liveStore.getOnline(arenaGroupId);
       if (online <= 0) {
-        // Arena emptied out — stop the loop until the next joiner.
-        const { game: after } = await liveStore.casGame(
+        // Arena emptied of real users — stop the loop until the next joiner,
+        // and let the idle game key age out so abandoned arenas don't keep
+        // state in Redis forever (the bot crowd key is independent).
+        const { won, game: after } = await liveStore.casGame(
           arenaGroupId,
           guardOf(game),
           {
@@ -288,6 +290,7 @@ export function createGameEngine(io, liveStore, hooks = {}) {
           }
         );
         current = after || game;
+        if (won) await liveStore.expireIdleGame(arenaGroupId);
       } else {
         const filter = await filterFor(game);
         const { game: won } = await startRound(game, filter, guardOf(game));

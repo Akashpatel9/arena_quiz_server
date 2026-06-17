@@ -1,7 +1,7 @@
 /**
  * Mini load through real browsers: 8 Chromium players in lock-step through a
  * full question → result → next-question cycle. (Real volume testing — 100s
- * to 1000s of players — stays in scripts/load.cjs over raw sockets; browsers
+ * to 1000s of players — stays in tests/load.cjs over raw sockets; browsers
  * are too heavy for that.)
  * Best watched headed: npx playwright test load --headed
  */

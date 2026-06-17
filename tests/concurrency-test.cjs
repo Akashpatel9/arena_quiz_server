@@ -1,6 +1,6 @@
 /**
  * Concurrency/race-condition test. Run server A with TIMER_SCALE=0.2 first:
- *   node scripts/concurrency-test.cjs
+ *   node tests/concurrency-test.cjs
  *
  * Covers:
  *  1. N simultaneous joins to an EMPTY arena → exactly one game start,

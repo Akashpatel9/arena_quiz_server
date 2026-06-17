@@ -42,7 +42,6 @@ Then:
 ```bash
 npm install
 cp .env.example .env        # defaults point at localhost Mongo/Redis
-npm run seed                # demo arena + 12 algebra questions
 npm start                   # http://localhost:3000
 ```
 
@@ -64,7 +63,7 @@ For development: `npm run dev` (auto-restart) or `npm run start:test`
   Mix freely — terminals and browser tabs all play in the same round.
 
 Things to watch: the first joiner starts the game instantly; someone joining
-mid-question sits on a waiting screen and enters at the next question;
+mid-question lands directly on the current question (or result);
 everyone's timer hits zero at the same moment; after a question, correct
 answerers see a speed-ranked graph (fastest first) — wrong/not-attempted see
 the correct answer and explanation but no graph. Kill the server mid-round
@@ -79,21 +78,20 @@ it is verified (test names refer to [Tests](#tests--verified-results)):
 |---|---|---|
 | Same question/result at the same time for everyone | absolute timestamps + room broadcast, [gameEngine.js](src/services/gameEngine.js) | e2e, load (byte-identical `endsAt` across 2,000 clients) |
 | Empty arena → joiner starts immediately | `ensureRunning` CAS idle→running | e2e, concurrency |
-| Join during a game → wait until next question | `resolveEligibility`, [arenaSocket.js](src/sockets/arenaSocket.js) | e2e, load (50-joiner wave) |
+| Join during a game → land directly on the live phase | `buildSnapshot`, [arenaSocket.js](src/sockets/arenaSocket.js) | e2e, load (50-joiner wave) |
 | Question timer: easy 30s / medium 60s / hard 90s | [gameConstants.js](src/config/gameConstants.js) | e2e |
 | Result timer: fixed 15s | [gameConstants.js](src/config/gameConstants.js) | e2e |
-| Waiting timer = question + result remaining | `buildSnapshot` (`waitMs`) | load |
 | One answer out of 4, locked | Redis `HSETNX` (atomic first-write-wins) | e2e, concurrency (two-socket race) |
 | Result always shows correct answer + explanation | `computeResults` | e2e, load |
 | Graph (speed-ranked) only for correct answers | `personalizeResult` | e2e, load |
-| Reconnect → return exactly where the game is | join-ack snapshot + Redis presence | e2e, crash |
+| Reconnect → return exactly where the game is | join-ack snapshot keyed by `userId` | e2e, crash |
 | Server crash → games not lost | state in Redis, `recoverRunningGames()` | crash (SIGKILL mid-round) |
 | Many servers later without a rewrite | atomic CAS transitions, per-server broadcast | concurrency (2 live instances) |
 
 ## Architecture
 
 > **Deep dive:** [ARCHITECTURE.md](ARCHITECTURE.md) walks through every flow
-> step by step — first joiner, waiting, answering, results, reconnects,
+> step by step — first joiner, answering, results, reconnects,
 > crashes, every race condition and its guard.
 
 ```
@@ -107,16 +105,15 @@ it is verified (test names refer to [Tests](#tests--verified-results)):
                                  ▼
                     Redis — THE live database:
                     game state (Lua CAS) · live answers (HSETNX)
-                    presence/eligibility · online counts
+                    online counts
 ```
 
-**Redis runs the live game; Mongo keeps history.** The game document
-(status/phase/round/timers), the current round's answers, presence, and
-online counts live in Redis ([liveStore.js](src/services/liveStore.js)).
-Mongo holds questions, arenas, users, and finished rounds' answers
-(batch-flushed once per round, fire-and-forget). A phase boundary performs
-**zero Mongo work on its critical path** — a slow Mongo can never delay or
-desync the loop.
+**Redis runs the live game; Mongo keeps reference data.** The game document
+(status/phase/round/timers), the current round's answers, and online counts
+live in Redis ([liveStore.js](src/services/liveStore.js)). Mongo holds only
+durable reference data — questions, arenas, users. Answers are Redis-only and
+ephemeral (never persisted), so a phase boundary performs **zero Mongo work**
+— a slow Mongo can never delay or desync the loop.
 
 **Timers are absolute timestamps, never countdowns.** Each phase stores its
 `phaseEndsAt`; servers schedule a wake-up for that instant and clients count
@@ -136,15 +133,15 @@ stored boundary. A *Redis* restart relies on Redis persistence (RDB default;
 `--appendonly yes` recommended, ~1s loss window).
 
 **Per-answer hot path:** cached game state (valid until the phase boundary by
-construction) + cached question + one Redis `HSETNX` — no DB round-trips. If
-Redis is briefly down, answers fall back to direct Mongo writes (the unique
-index dedupes); the game loop itself requires Redis.
+construction) + cached question + one Redis `HSETNX` — no DB round-trips.
+Answers are Redis-only; if Redis is unhealthy the answer is rejected
+(`NOT_ACCEPTING`) rather than dropped, since the game loop itself requires
+Redis.
 
-**The "waiting" rule:** waiting is a property of the *user*, not the game.
-Joiners get `eligibleFromRound = current round + 1` (stored in Redis
-presence); the server sends them no question/result data for rounds they
-didn't play. A quick reconnect inside one game cycle keeps the previous
-eligibility — that's how a dropped connection resumes mid-round.
+**Mid-game joining:** there is no waiting phase — a joiner is dropped straight
+onto the live phase from the join snapshot, answering the current question or
+viewing the current result. A reconnect is the same path: re-emit `arena:join`
+and the snapshot resumes the player exactly where the game is now.
 
 ## Project structure
 
@@ -152,18 +149,16 @@ eligibility — that's how a dropped connection resumes mid-round.
 src/
   config/          env.js · db.js · gameConstants.js (ALL timing rules)
   models/          Mongo (durable): ArenaGroupModel, Question (read-only
-                   view of phoenix-owned collection), AuthUser,
-                   ArenaAnswerModel (round history, unique answer index)
-  services/        liveStore.js   — all Redis: game CAS, answers, presence
+                   view of phoenix-owned collection), AuthUser
+  services/        liveStore.js   — all Redis: game CAS, answers, online counts
                    gameEngine.js  — the phase machine (core of the system)
                    questionService.js — filtered random question picker
                    botService.js  — simulated players (crowd + answers)
-  sockets/         arenaSocket.js — join/answer/sync/leave, auth, presence
+  sockets/         arenaSocket.js — join/answer/sync/leave, auth, online counts
   routes/          arenaRoutes.js — REST (arena list, live state peek)
   app.js, server.js
 public/index.html  browser client (no build step)
 scripts/
-  seed.js          demo arena + questions (idempotent)
   play.cjs         interactive terminal player
   e2e.cjs · load.cjs · crash-test.cjs · concurrency-test.cjs
   bot-test.cjs     bot crowd, profiles, accuracy, drift   (see Tests)
@@ -191,9 +186,9 @@ Server → client:
 | `arena:online` | joins/leaves, bot drift | `{count, humans, bots}` — `count` includes the bot crowd |
 
 The join/sync **snapshot** tells a client exactly where the game is:
-`{status, phase, round, phaseEndsAt, remainingMs, waiting, waitMs, question?,
-result?, yourAnswer?, serverTime}`. Reconnection = re-emit `arena:join`,
-render the snapshot. Waiting users receive no question/result content.
+`{status, phase, round, phaseEndsAt, remainingMs, question?, result?,
+yourAnswer?, serverTime}`. Reconnection = re-emit `arena:join`, render the
+snapshot.
 
 ## REST API
 
@@ -233,7 +228,7 @@ the "answer time" is randomized inside the question timer
 
 Mechanically, bots are only a count in Redis (`arena:{id}:bots`) plus
 entries in the round's answer hash, written in one pipeline by the server
-that wins the round's CAS — exactly once per round, no sockets, no presence.
+that wins the round's CAS — exactly once per round, no sockets.
 Displayed online counts (`arena:online`, lobby `online_user_count`,
 `/state`) include bots; the engine's idle check reads the **human-only**
 counter, so an arena with only bots still goes idle and bots never keep a
@@ -269,22 +264,19 @@ mocks). All results below were produced on a single laptop running the
 server, both databases, and every simulated client — i.e. conservative.
 
 **e2e (9 checks):** immediate start for first joiner · answer lock +
-duplicate rejection · mid-game joiner waits, then enters at next question ·
-result with explanation, graph only when correct · identical round broadcast
-· reconnect snapshot lands exactly in place.
+duplicate rejection · mid-game joiner lands directly on the live question and
+can answer it · result with explanation, graph only when correct · identical
+round broadcast · reconnect snapshot lands exactly in place.
 
 **ui (Playwright, real Chromium):** two browser players through a full round
 — question renders, picked option locks and disables, a mid-question joiner
-sees the waiting screen with a live countdown and no question/result content,
-the result screen shows outcome + explanation with the graph only when
-correct ("you" highlighted), and both land on the same next round where the
-former waiter answers. Plus: a full page reload mid-game keeps the player's
-identity (sessionStorage) and lands them back in place — never on the
-waiting screen.
+lands directly on the live question and answers it, the result screen shows
+outcome + explanation with the graph only when correct ("you" highlighted),
+and both land on the same next round. Plus: a full page reload mid-game keeps
+the player's identity (sessionStorage) and lands them back in place.
 
-**load** (also asserts the waiting flow under load — a 50-joiner wave
-mid-question all land in `waiting` with correct `waitMs`, leak no question or
-result data, and all enter+answer the next round):
+**load** (also asserts mid-game joining under load — a 50-joiner wave
+mid-question all land directly on the live question, then answer it):
 
 | players | join ack p95 | answer ack p95 | result delivery spread | after scheduled end |
 |---|---|---|---|---|

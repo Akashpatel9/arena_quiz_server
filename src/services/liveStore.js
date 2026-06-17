@@ -7,6 +7,12 @@ const ANSWER_TTL_MS = 30 * 60 * 1000;
 // Bot counts are touched on every drift step; arenas that stop drifting
 // (deactivated, server gone) age out instead of leaking keys.
 const BOTS_TTL_MS = 24 * 60 * 60 * 1000;
+// When an arena empties of real users the game goes idle; the idle key then
+// ages out after this window so abandoned arenas don't keep state in Redis
+// forever. A player returning within the window resumes the same game (round
+// continuity); after it, a fresh game starts from round 0. The bots key is
+// independent and untouched.
+const IDLE_GAME_TTL_MS = 10 * 60 * 1000;
 
 /**
  * Redis is the database for everything LIVE; Mongo keeps durable history.
@@ -163,13 +169,25 @@ export function createLiveStore() {
       return raws.filter(Boolean).map((r) => hydrateGame(JSON.parse(r)));
     },
 
-    /** Wipe an arena's live keys (used by the seed script). */
+    /** Wipe an arena's live keys. */
     async clearArena(arenaGroupId) {
       await redis.del(
         gameKey(arenaGroupId),
         onlineKey(arenaGroupId),
         botsKey(arenaGroupId)
       );
+    },
+
+    /**
+     * The arena emptied of humans and went idle — let the idle game key age
+     * out so abandoned arenas don't keep state in Redis forever. The next
+     * phase transition or a player's restart re-SETs the key without a TTL, so
+     * an active game never expires mid-play; the bots key is left untouched.
+     */
+    async expireIdleGame(arenaGroupId) {
+      await redis
+        .pexpire(gameKey(arenaGroupId), IDLE_GAME_TTL_MS)
+        .catch(() => {});
     },
 
     // ----------------------------------------------------------- online

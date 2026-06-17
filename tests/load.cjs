@@ -4,7 +4,7 @@
  * mid-round (no waiting phase) and answers it too. Measures ack latencies and
  * fan-out spread.
  * Run the server with TIMER_SCALE=0.2 first, then:
- *   node scripts/load.cjs [N=300]
+ *   node tests/load.cjs [N=300]
  * (All clients share this one Node process, so the numbers are conservative —
  * the test client itself becomes a bottleneck before the server does.)
  */

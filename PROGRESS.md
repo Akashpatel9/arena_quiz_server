@@ -55,11 +55,11 @@ Mongo collections are unused (stale data may remain; safe to drop).
 
 Verified (2026-06-12, Docker mongo + redis), all passing:
 
-- **scripts/e2e.cjs** (9 checks): immediate start for first joiner; answer
+- **tests/e2e.cjs** (9 checks): immediate start for first joiner; answer
   lock + duplicate rejection; mid-game joiner waits then enters at next
   question; result with explanation and correct-only speed graph; synced
   round broadcast; reconnect snapshot.
-- **scripts/load.cjs**, one arena, all clients + server + both DBs on one
+- **tests/load.cjs**, one arena, all clients + server + both DBs on one
   laptop (numbers are conservative — the single-process test client is its
   own bottleneck):
   | players | join ack p95 | answer ack p95 | result spread | after sched. end |
@@ -74,7 +74,7 @@ Verified (2026-06-12, Docker mongo + redis), all passing:
   a late-joiner wave mid-question all land in 'waiting' with the correct
   waitMs, see no question data and no result for the round they didn't play,
   and are all let in (and can answer) exactly at the next question.
-- **scripts/crash-test.cjs**: SIGKILL mid-question with live, answered
+- **tests/crash-test.cjs**: SIGKILL mid-question with live, answered
   clients → restart → same round, same phase, 0ms timer drift, the answer
   still locked (from Redis), players kept their seats, loop continued.
 - **tests/arena.spec.cjs** (Playwright, real Chromium pages): full two-player
@@ -82,13 +82,13 @@ Verified (2026-06-12, Docker mongo + redis), all passing:
   result with explanation and correct-only graph, synced next round) and a
   mid-game page reload that keeps identity and lands back in place. 2/2
   passing in 36s against a TIMER_SCALE=0.2 server.
-- **scripts/bot-test.cjs** (9 checks): bot crowd within [10,100] and present
+- **tests/bot-test.cjs** (9 checks): bot crowd within [10,100] and present
   in the live round's answers; every bot answer carries name/photo;
   per-round accuracy lands inside the difficulty band; bot times inside the
   question timer; a correct human lands ranked on a graph mixed with bot
   entries (profile fields included); `/state` and `arena:online` report
   `humans + bots`; the population drifts across two 10s steps.
-- **scripts/concurrency-test.cjs** (9 checks): 20 simultaneous joins to an
+- **tests/concurrency-test.cjs** (9 checks): 20 simultaneous joins to an
   empty arena start the game exactly once with everyone seated; the same
   user racing answers from two sockets gets exactly one accepted; **two
   server instances sharing Redis/Mongo** ran the same game with identical

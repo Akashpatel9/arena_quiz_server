@@ -1,6 +1,6 @@
 /**
  * End-to-end test of the live arena over real sockets.
- * Run the server with TIMER_SCALE=0.2 first, then: node scripts/e2e.cjs
+ * Run the server with TIMER_SCALE=0.2 first, then: node tests/e2e.cjs
  * Uses the socket.io client bundle that ships inside the socket.io package.
  */
 const { io } = require("../node_modules/socket.io/client-dist/socket.io.js");

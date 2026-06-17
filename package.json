@@ -9,15 +9,15 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "start:test": "TIMER_SCALE=0.2 node src/server.js",
-    "seed": "node scripts/seed.js",
+    "create:bots": "node scripts/create-bots.js",
     "play": "node scripts/play.cjs",
-    "test": "node scripts/e2e.cjs",
+    "test": "node tests/e2e.cjs",
     "test:ui": "playwright test",
     "test:ui:headed": "playwright test --headed",
-    "test:load": "node scripts/load.cjs",
-    "test:crash": "node scripts/crash-test.cjs",
-    "test:concurrency": "node scripts/concurrency-test.cjs",
-    "test:bots": "node scripts/bot-test.cjs"
+    "test:load": "node tests/load.cjs",
+    "test:crash": "node tests/crash-test.cjs",
+    "test:concurrency": "node tests/concurrency-test.cjs",
+    "test:bots": "node tests/bot-test.cjs"
   },
   "engines": {
     "node": ">=18"

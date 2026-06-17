@@ -2,7 +2,7 @@
  * Crash-recovery test: clients join and answer, the server is SIGKILLed
  * mid-question, restarted, and must come back at the SAME round/phase with
  * the answer still locked in. Run the server with TIMER_SCALE=0.2 first:
- *   node scripts/crash-test.cjs
+ *   node tests/crash-test.cjs
  */
 const { execSync, spawn } = require("node:child_process");
 const path = require("node:path");
